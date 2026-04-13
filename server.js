@@ -369,6 +369,44 @@ app.post('/api/broadcast',async(req,res)=>{
   res.json({ok:true,contacts:contacts.length,audio:audio.name});
   triggerBroadcast(audio,contacts).catch(console.error);});
 
+// SMS broadcast
+app.post('/api/sms', async (req,res) => {
+  const { message, contactIds } = req.body;
+  if (!message) return res.status(400).json({ error: 'message required' });
+  const contacts = contactIds?.length
+    ? DATA.contacts.filter(c => contactIds.includes(c.id))
+    : DATA.contacts;
+  if (!contacts.length) return res.status(400).json({ error: 'No contacts' });
+
+  res.json({ ok: true, sent: contacts.length, message: message.slice(0,50)+'…' });
+
+  // Fire SMS async
+  (async () => {
+    console.log(`💬 SMS broadcast to ${contacts.length} contacts`);
+    let sent = 0, failed = 0;
+    for (let i = 0; i < contacts.length; i++) {
+      const c = contacts[i];
+      if (!c.phone) continue;
+      if (i > 0) await sleep(500); // 500ms between SMS
+      const phone = normalizePhone(c.phone);
+      try {
+        const r = await fetch('https://api.telnyx.com/v2/messages', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${TELNYX_API_KEY}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            from: TELNYX_FROM,
+            to: phone,
+            text: message,
+          }),
+        });
+        if (r.ok) { sent++; console.log(`  ✅ SMS ${i+1}/${contacts.length} ${c.name} (${phone})`); }
+        else { const t=await r.text(); console.error(`  ❌ SMS ${c.name}: ${t.slice(0,150)}`); failed++; }
+      } catch(e) { console.error(`  ❌ SMS ${c.name}: ${e.message}`); failed++; }
+    }
+    console.log(`💬 SMS done — sent: ${sent}, failed: ${failed}`);
+  })().catch(console.error);
+});
+
 app.post('/api/schedule',(req,res)=>{
   const{audioId,recipientIds,scheduledFor,name}=req.body;
   if(!audioId||!scheduledFor)return res.status(400).json({error:'audioId+scheduledFor required'});
