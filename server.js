@@ -17,11 +17,43 @@ const TELNYX_FROM    = normalizePhone(process.env.TELNYX_FROM_NUMBER || '');
 const TELNYX_CONN_ID = process.env.TELNYX_CONNECTION_ID || '';
 const SERVER_URL     = (process.env.SERVER_URL || '').replace(/\/$/, '');
 
+// Persist data to file so it survives server restarts within a session
+const DATA_FILE = '/tmp/familyring_data.json';
+
+function loadData() {
+  try {
+    if (require('fs').existsSync(DATA_FILE)) {
+      const d = JSON.parse(require('fs').readFileSync(DATA_FILE, 'utf8'));
+      console.log(`📂 Loaded persisted data: ${d.contacts?.length||0} contacts, ${d.audioLib?.length||0} audio files`);
+      return d;
+    }
+  } catch(e) { console.log('No persisted data found, starting fresh'); }
+  return null;
+}
+
+function saveData() {
+  try {
+    require('fs').writeFileSync(DATA_FILE, JSON.stringify({
+      contacts: DATA.contacts,
+      audioLib: DATA.audioLib,
+      ivrSettings: DATA.ivrSettings,
+      scheduled: DATA.scheduled.filter(s=>s.status==='pending'),
+    }));
+  } catch(e) { console.error('Save data error:', e.message); }
+}
+
+const _saved = loadData();
 const DATA = {
-  contacts: [], audioLib: [],
-  ivrSettings: { greetingId: null, line2Id: null, broadcastPin: process.env.BROADCAST_PIN || '1234' },
-  broadcasts: [], callLog: [], voicemails: [], scheduled: [],
+  contacts:    _saved?.contacts    || [],
+  audioLib:    _saved?.audioLib    || [],
+  ivrSettings: _saved?.ivrSettings || { greetingId: null, line2Id: null, broadcastPin: process.env.BROADCAST_PIN || '1234' },
+  broadcasts:  [],
+  callLog:     [],
+  voicemails:  [],
+  scheduled:   _saved?.scheduled   || [],
 };
+// Ensure PIN from env takes precedence if set
+if (process.env.BROADCAST_PIN) DATA.ivrSettings.broadcastPin = process.env.BROADCAST_PIN;
 
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,7);
 function normalizePhone(p) {
@@ -115,7 +147,7 @@ async function handleInbound(type, payload, ccid, state) {
       const d = (digits||'').replace('#','');
       if (d === '1') {
         const audio = {id:uid(),name:'Inbound Broadcast '+new Date().toLocaleString(),publicUrl:state.recordingUrl,isBroadcast:true,date:new Date().toLocaleDateString()};
-        DATA.audioLib.push(audio);
+        DATA.audioLib.push(audio);saveData();
         await cmd(ccid,'speak',{payload:`Approved. Sending to all ${DATA.contacts.length} contacts. Thank you. Goodbye.`,
           voice:'female',language:'en-US',client_state:enc({mode:'inbound_ivr',step:'goodbye',callerPhone:caller})});
         setTimeout(()=>triggerBroadcast(audio,DATA.contacts).catch(console.error),2000);
@@ -288,15 +320,15 @@ app.get('/',(req,res)=>res.json({status:'✅ FamilyRing Server',contacts:DATA.co
 
 app.post('/api/sync/contacts',(req,res)=>{
   if(!Array.isArray(req.body.contacts))return res.status(400).json({error:'array required'});
-  DATA.contacts=req.body.contacts;console.log(`✅ ${DATA.contacts.length} contacts`);res.json({ok:true,count:DATA.contacts.length});});
+  DATA.contacts=req.body.contacts;saveData();console.log(`✅ ${DATA.contacts.length} contacts`);res.json({ok:true,count:DATA.contacts.length});});
 
 app.post('/api/sync/ivr',(req,res)=>{
   const{broadcastPin,enabled,greetingId,line2Id}=req.body;
   if(broadcastPin!==undefined)DATA.ivrSettings.broadcastPin=broadcastPin;
   if(enabled!==undefined)DATA.ivrSettings.enabled=enabled;
-  if(greetingId!==undefined)DATA.ivrSettings.greetingId=greetingId;
+  if(greedingId!==undefined)DATA.ivrSettings.greetingId=greetingId;
   if(line2Id!==undefined)DATA.ivrSettings.line2Id=line2Id;
-  res.json({ok:true});});
+  saveData();res.json({ok:true});});
 
 app.post('/api/audio/upload',(req,res)=>{
   const{name,data,type,isBroadcast,isGreeting,isLine2}=req.body;
@@ -307,6 +339,7 @@ app.post('/api/audio/upload',(req,res)=>{
   DATA.audioLib.push(entry);
   if(isGreeting){DATA.ivrSettings.greetingId=id;console.log(`✅ Greeting: "${name}"`);}
   if(isLine2){DATA.ivrSettings.line2Id=id;console.log(`✅ Line2: "${name}"`);}
+  saveData();
   console.log(`✅ Audio: "${name}" (${Math.round(data.length/1024)}KB)`);
   res.json({ok:true,id,publicUrl:entry.publicUrl});});
 
@@ -334,6 +367,7 @@ app.post('/api/schedule',(req,res)=>{
   if(!audio)return res.status(404).json({error:'Audio not found'});
   const entry={id:uid(),audioId,recipientIds:recipientIds||[],scheduledFor,name:name||audio.name,status:'pending',created:new Date().toISOString()};
   DATA.scheduled.push(entry);
+  saveData();
   console.log(`⏰ Scheduled: "${entry.name}" for ${scheduledFor}`);
   res.json({ok:true,id:entry.id});});
 
