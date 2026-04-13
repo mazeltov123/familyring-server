@@ -363,6 +363,56 @@ function startScheduler() {
   console.log('⏰ Scheduler running (every 60s)');
 }
 
+// PWA Manifest
+app.get('/manifest.json', (req, res) => {
+  res.json({
+    name: 'FamilyRing',
+    short_name: 'FamilyRing',
+    description: 'Family broadcast calling system',
+    start_url: '/app',
+    display: 'standalone',
+    background_color: '#f6f1eb',
+    theme_color: '#2a2420',
+    orientation: 'portrait',
+    icons: [
+      { src: '/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any maskable' },
+      { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any maskable' },
+    ]
+  });
+});
+
+// Generate a simple PNG icon programmatically
+function generateIconPng(size) {
+  // Minimal valid PNG with FamilyRing colors (dark background, phone emoji area)
+  // We'll serve a simple colored square PNG
+  const { createCanvas } = (() => { try { return require('canvas'); } catch(e) { return null; } })() || {};
+  return null; // fallback to SVG-based approach below
+}
+
+app.get('/icon-:size.png', (req, res) => {
+  const size = parseInt(req.params.size) || 192;
+  // Serve an SVG as PNG fallback (browsers accept this for PWA icons)
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">
+    <rect width="${size}" height="${size}" rx="${size*0.2}" fill="#2a2420"/>
+    <text x="50%" y="55%" font-size="${size*0.55}" text-anchor="middle" dominant-baseline="middle" font-family="Arial">📞</text>
+    <text x="50%" y="83%" font-size="${size*0.14}" text-anchor="middle" fill="#d4853a" font-family="Arial" font-weight="bold">FamilyRing</text>
+  </svg>`;
+  res.setHeader('Content-Type', 'image/svg+xml');
+  res.send(svg);
+});
+
+// Service worker for offline support
+app.get('/sw.js', (req, res) => {
+  res.type('application/javascript');
+  res.send(`
+self.addEventListener('fetch', e => {
+  e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
+});
+self.addEventListener('install', e => self.skipWaiting());
+self.addEventListener('activate', e => clients.claim());
+  `);
+});
+
 // Serve the FamilyRing web app
 let APP_HTML = null;
 app.get('/app', (req, res) => {
