@@ -112,7 +112,10 @@ async function handleInbound(type, payload, ccid, state) {
 
     if (state.step === 'menu') {
       if (digits === '1') {
-        const list = DATA.audioLib.filter(a=>a.isBroadcast&&a.publicUrl).reverse();
+        // Include audio used in any past broadcast OR flagged as broadcast
+        const usedAudioIds=new Set(DATA.broadcasts.map(b=>b.audioId).filter(Boolean));
+        const list=DATA.audioLib.filter(a=>a.publicUrl&&(a.isBroadcast||usedAudioIds.has(a.id))).reverse();
+        console.log(`[IVR] Broadcast list: ${list.length} items, audioLib: ${DATA.audioLib.length}, broadcasts: ${DATA.broadcasts.length}`);
         if (!list.length) {
           await cmd(ccid,'speak',{payload:'No broadcasts available. Goodbye.',voice:'female',language:'en-US',client_state:enc({mode:'inbound_ivr',step:'goodbye',callerPhone:caller})});
         } else {
@@ -160,7 +163,8 @@ async function handleInbound(type, payload, ccid, state) {
   } else if (type === 'call.speak.ended') {
     const step = state.step;
     if (step === 'announce_broadcast') {
-      const list = DATA.audioLib.filter(a=>a.isBroadcast&&a.publicUrl).reverse();
+      const usedAudioIds2=new Set(DATA.broadcasts.map(b=>b.audioId).filter(Boolean));
+      const list = DATA.audioLib.filter(a=>a.publicUrl&&(a.isBroadcast||usedAudioIds2.has(a.id))).reverse();
       const idx  = state.broadcastIndex||0;
       if (list[idx]?.publicUrl) {
         await cmd(ccid,'playback_start',{audio_url:list[idx].publicUrl,
@@ -187,7 +191,8 @@ async function handleInbound(type, payload, ccid, state) {
       await cmd(ccid,'speak',{payload:'Please record your message after the beep. Hang up when done.',voice:'female',language:'en-US',
         client_state:enc({mode:'inbound_ivr',step:'record_prompt',callerPhone:caller})});
     } else if (step === 'playing_broadcast') {
-      const list = DATA.audioLib.filter(a=>a.isBroadcast&&a.publicUrl).reverse();
+      const usedAudioIds3=new Set(DATA.broadcasts.map(b=>b.audioId).filter(Boolean));
+      const list = DATA.audioLib.filter(a=>a.publicUrl&&(a.isBroadcast||usedAudioIds3.has(a.id))).reverse();
       const next = (state.broadcastIndex||0)+1;
       if (next < list.length && list[next]?.publicUrl) {
         await cmd(ccid,'speak',{payload:`Next: ${list[next].name}.`,voice:'female',language:'en-US',
@@ -273,6 +278,10 @@ app.post('/ivr/incoming', async (req,res) => {
 async function triggerBroadcast(audio, contacts) {
   if (!contacts.length) return;
   console.log(`\n📢 BROADCAST "${audio.name}" → ${contacts.length} contacts`);
+  // Mark audio as broadcast so IVR can play it back
+  const audioEntry = DATA.audioLib.find(a=>a.id===audio.id);
+  if(audioEntry && !audioEntry.isBroadcast){ audioEntry.isBroadcast=true; saveData(); }
+
   const rec={id:uid(),audioName:audio.name,audioId:audio.id,startTime:new Date().toISOString(),
     totalContacts:contacts.length,answered:0,missed:0,status:'running'};
   DATA.broadcasts.push(rec);
@@ -381,6 +390,14 @@ app.get('/api/voicemails',(req,res)=>res.json(DATA.voicemails));
 app.delete('/api/voicemails/:id',(req,res)=>{DATA.voicemails=DATA.voicemails.filter(v=>v.id!==req.params.id);res.json({ok:true});});
 app.get('/api/calllog',(req,res)=>res.json(DATA.callLog.slice(-200).reverse()));
 app.get('/api/broadcasts',(req,res)=>res.json([...DATA.broadcasts].reverse()));
+// Mark audio as available for IVR broadcast playback
+app.post('/api/audio/:id/mark-broadcast',(req,res)=>{
+  const a=DATA.audioLib.find(x=>x.id===req.params.id);
+  if(!a)return res.status(404).json({error:'Not found'});
+  a.isBroadcast=true;saveData();
+  res.json({ok:true,name:a.name});
+});
+
 app.get('/api/data',(req,res)=>res.json({contacts:DATA.contacts.length,
   audioLib:DATA.audioLib.map(a=>({id:a.id,name:a.name,publicUrl:a.publicUrl,isBroadcast:a.isBroadcast,isGreeting:a.isGreeting,isLine2:a.isLine2})),
   ivrSettings:{...DATA.ivrSettings,broadcastPin:'****'},broadcasts:DATA.broadcasts,voicemails:DATA.voicemails,scheduled:DATA.scheduled}));
