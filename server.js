@@ -229,17 +229,57 @@ async function handleInbound(type, payload, ccid, state) {
 }
 
 async function handleOutbound(type, payload, ccid, state) {
-  const { audioUrl, contactName, phone, broadcastId } = state;
+  const { audioUrl, contactName, phone, broadcastId, rsvp } = state;
 
   if (type === 'call.answered') {
-    console.log(`[OUT] Answered: ${contactName}`);
+    console.log(`[OUT] Answered: ${contactName} rsvp=${!!rsvp}`);
     if (audioUrl) {
       await cmd(ccid,'playback_start',{audio_url:audioUrl,client_state:enc(state)});
     } else {
       await cmd(ccid,'speak',{payload:'Hello, this is a message from Family Ring.',voice:'female',language:'en-US',client_state:enc(state)});
     }
+
   } else if (type === 'call.playback.ended' || type === 'call.speak.ended') {
-    await cmd(ccid,'hangup',{});
+    // If RSVP options exist, gather response after audio plays
+    if (rsvp && rsvp.options && rsvp.options.length > 0 && state.step !== 'rsvp_done') {
+      const prompt = rsvp.options.map((o,i) => `Press ${o.key} ${o.label}`).join('. ');
+      const validDigits = rsvp.options.map(o=>o.key).join('');
+      await cmd(ccid, 'gather_using_speak', {
+        payload: prompt,
+        voice: 'female', language: 'en-US',
+        minimum_digits: 1, maximum_digits: 1,
+        valid_digits: validDigits,
+        inter_digit_timeout_secs: 10,
+        client_state: enc({...state, step:'rsvp_waiting'}),
+      });
+    } else {
+      await cmd(ccid,'hangup',{});
+    }
+
+  } else if (type === 'call.gather.ended' && state.step === 'rsvp_waiting') {
+    const digit = payload?.digits || '';
+    const option = rsvp?.options?.find(o => o.key === digit);
+    console.log(`[RSVP] ${contactName} pressed ${digit} = ${option?.label || 'unknown'}`);
+    // Save the response
+    if (broadcastId) {
+      const br = DATA.broadcasts.find(b => b.id === broadcastId);
+      if (br) {
+        if (!br.rsvpResponses) br.rsvpResponses = [];
+        br.rsvpResponses.push({
+          contactName, phone, digit,
+          label: option?.label || digit,
+          time: new Date().toISOString(),
+        });
+        saveData();
+      }
+    }
+    // Thank them and hang up
+    const thanks = option?.thanks || 'Thank you. Goodbye.';
+    await cmd(ccid, 'speak', {
+      payload: thanks, voice:'female', language:'en-US',
+      client_state: enc({...state, step:'rsvp_done'}),
+    });
+
   } else if (type === 'call.hangup') {
     const cause = payload?.hangup_cause||'unknown';
     const s = payload?.start_time?new Date(payload.start_time):null;
@@ -275,7 +315,7 @@ app.post('/ivr/incoming', async (req,res) => {
   } catch(e) { console.error('Handler error:',e.message,e.stack?.slice(0,300)); }
 });
 
-async function triggerBroadcast(audio, contacts) {
+async function triggerBroadcast(audio, contacts, rsvp=null) {
   if (!contacts.length) return;
   console.log(`\n📢 BROADCAST "${audio.name}" → ${contacts.length} contacts`);
   // Mark audio as broadcast so IVR can play it back
@@ -283,7 +323,8 @@ async function triggerBroadcast(audio, contacts) {
   if(audioEntry && !audioEntry.isBroadcast){ audioEntry.isBroadcast=true; saveData(); }
 
   const rec={id:uid(),audioName:audio.name,audioId:audio.id,startTime:new Date().toISOString(),
-    totalContacts:contacts.length,answered:0,missed:0,status:'running'};
+    totalContacts:contacts.length,answered:0,missed:0,status:'running',
+    rsvpOptions:rsvp?.options||null, rsvpResponses:[]};
   DATA.broadcasts.push(rec);
   for (let i=0;i<contacts.length;i++) {
     const c=contacts[i];
@@ -296,7 +337,7 @@ async function triggerBroadcast(audio, contacts) {
         headers:{'Authorization':`Bearer ${TELNYX_API_KEY}`,'Content-Type':'application/json'},
         body:JSON.stringify({connection_id:TELNYX_CONN_ID,to:phone,from:TELNYX_FROM,
           webhook_url:`${SERVER_URL}/ivr/incoming`,webhook_url_method:'POST',
-          client_state:enc({broadcastId:rec.id,contactName:c.name||'',phone,audioUrl:audio.publicUrl||''}),
+          client_state:enc({broadcastId:rec.id,contactName:c.name||'',phone,audioUrl:audio.publicUrl||'',rsvp:rsvp||null}),
           timeout_secs:30}),
       });
       if (r.ok) console.log(`  ✅ ${i+1}/${contacts.length} ${c.name} (${phone})`);
@@ -361,13 +402,13 @@ app.get('/api/audio/:id',(req,res)=>{
   res.send(Buffer.from(b64,'base64'));});
 
 app.post('/api/broadcast',async(req,res)=>{
-  const{audioId,contactIds}=req.body;
+  const{audioId,contactIds,rsvp}=req.body;
   const audio=DATA.audioLib.find(a=>a.id===audioId);
   if(!audio)return res.status(404).json({error:'Audio not found'});
   const contacts=contactIds?.length?DATA.contacts.filter(c=>contactIds.includes(c.id)):DATA.contacts;
   if(!contacts.length)return res.status(400).json({error:'No contacts'});
-  res.json({ok:true,contacts:contacts.length,audio:audio.name});
-  triggerBroadcast(audio,contacts).catch(console.error);});
+  res.json({ok:true,contacts:contacts.length,audio:audio.name,broadcastId:'pending'});
+  triggerBroadcast(audio,contacts,rsvp||null).catch(console.error);});
 
 // SMS broadcast
 app.post('/api/sms', async (req,res) => {
@@ -428,6 +469,11 @@ app.get('/api/voicemails',(req,res)=>res.json(DATA.voicemails));
 app.delete('/api/voicemails/:id',(req,res)=>{DATA.voicemails=DATA.voicemails.filter(v=>v.id!==req.params.id);res.json({ok:true});});
 app.get('/api/calllog',(req,res)=>res.json(DATA.callLog.slice(-200).reverse()));
 app.get('/api/broadcasts',(req,res)=>res.json([...DATA.broadcasts].reverse()));
+app.get('/api/broadcasts/:id/rsvp',(req,res)=>{
+  const br=DATA.broadcasts.find(b=>b.id===req.params.id);
+  if(!br)return res.status(404).json({error:'Not found'});
+  res.json({broadcastId:br.id,audioName:br.audioName,rsvpOptions:br.rsvpOptions||[],responses:br.rsvpResponses||[],totalContacts:br.totalContacts,answered:br.answered});
+});
 // Mark audio as available for IVR broadcast playback
 app.post('/api/audio/:id/mark-broadcast',(req,res)=>{
   const a=DATA.audioLib.find(x=>x.id===req.params.id);
