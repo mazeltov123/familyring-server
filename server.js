@@ -363,10 +363,33 @@ function startScheduler() {
   console.log('⏰ Scheduler running (every 60s)');
 }
 
+// Serve the FamilyRing web app
+let APP_HTML = null;
+app.get('/app', (req, res) => {
+  if (APP_HTML) {
+    res.type('text/html');
+    res.send(APP_HTML);
+  } else {
+    res.type('text/html');
+    res.send('<h2>App not uploaded yet. POST the HTML to /api/app/upload</h2><p>Or visit <a href="/">server status</a></p>');
+  }
+});
+
+// Upload the app HTML (call this once after deploying)
+app.post('/api/app/upload', (req, res) => {
+  const { html } = req.body;
+  if (!html) return res.status(400).json({ error: 'html required' });
+  APP_HTML = html;
+  console.log(`✅ App HTML uploaded (${Math.round(html.length/1024)}KB)`);
+  res.json({ ok: true, url: SERVER_URL + '/app', size: Math.round(html.length/1024) + 'KB' });
+});
+
 app.get('/',(req,res)=>res.json({status:'✅ FamilyRing Server',contacts:DATA.contacts.length,audio:DATA.audioLib.length,
   broadcasts:DATA.broadcasts.length,voicemails:DATA.voicemails.length,
   scheduled:DATA.scheduled.filter(s=>s.status==='pending').length,
-  greeting:DATA.ivrSettings.greetingId?'✅':'❌ not uploaded',pin:DATA.ivrSettings.broadcastPin?'✅':'❌',webhook:`${SERVER_URL}/ivr/incoming`}));
+  greeting:DATA.ivrSettings.greetingId?'✅':'❌ not uploaded',pin:DATA.ivrSettings.broadcastPin?'✅':'❌',
+  webhook:`${SERVER_URL}/ivr/incoming`,
+  app:`${SERVER_URL}/app`}));
 
 app.post('/api/sync/contacts',(req,res)=>{
   if(!Array.isArray(req.body.contacts))return res.status(400).json({error:'array required'});
@@ -407,8 +430,14 @@ app.post('/api/broadcast',async(req,res)=>{
   if(!audio)return res.status(404).json({error:'Audio not found'});
   const contacts=contactIds?.length?DATA.contacts.filter(c=>contactIds.includes(c.id)):DATA.contacts;
   if(!contacts.length)return res.status(400).json({error:'No contacts'});
-  res.json({ok:true,contacts:contacts.length,audio:audio.name,broadcastId:'pending'});
-  triggerBroadcast(audio,contacts,rsvp||null).catch(console.error);});
+  // Create broadcast record immediately so we can return the ID
+  const bcastId=uid();
+  const rec={id:bcastId,audioName:audio.name,audioId:audio.id,startTime:new Date().toISOString(),
+    totalContacts:contacts.length,answered:0,missed:0,status:'running',
+    rsvpOptions:rsvp?.options||null,rsvpResponses:[]};
+  DATA.broadcasts.push(rec);
+  res.json({ok:true,contacts:contacts.length,audio:audio.name,broadcastId:bcastId});
+  triggerBroadcast(audio,contacts,rsvp||null,bcastId).catch(console.error);});
 
 // SMS broadcast
 app.post('/api/sms', async (req,res) => {
