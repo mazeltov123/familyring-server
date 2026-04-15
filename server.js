@@ -38,6 +38,7 @@ function saveData() {
       audioLib: DATA.audioLib,
       ivrSettings: DATA.ivrSettings,
       scheduled: DATA.scheduled.filter(s=>s.status==='pending'),
+      inboundSms: DATA.inboundSms.slice(-200),
     }));
   } catch(e) { console.error('Save data error:', e.message); }
 }
@@ -50,6 +51,7 @@ const DATA = {
   broadcasts:  [],
   callLog:     [],
   voicemails:  [],
+  inboundSms:  [],
   scheduled:   _saved?.scheduled   || [],
 };
 // Ensure PIN from env takes precedence if set
@@ -443,6 +445,8 @@ app.get('/',(req,res)=>res.json({status:'✅ FamilyRing Server',contacts:DATA.co
   scheduled:DATA.scheduled.filter(s=>s.status==='pending').length,
   greeting:DATA.ivrSettings.greetingId?'✅':'❌ not uploaded',pin:DATA.ivrSettings.broadcastPin?'✅':'❌',
   webhook:`${SERVER_URL}/ivr/incoming`,
+  smsWebhook:`${SERVER_URL}/ivr/sms`,
+  inboundSms:DATA.inboundSms.length,
   app:`${SERVER_URL}/app`}));
 
 app.post('/api/sync/contacts',(req,res)=>{
@@ -494,6 +498,41 @@ app.post('/api/broadcast',async(req,res)=>{
   DATA.broadcasts.push(rec);
   res.json({ok:true,contacts:contacts.length,audio:audio.name,broadcastId:bcastId});
   triggerBroadcast(audio,contacts,rsvp||null,bcastId).catch(console.error);});
+
+// Inbound SMS webhook (Telnyx sends here when someone texts your number)
+app.post('/ivr/sms', (req, res) => {
+  res.sendStatus(200);
+  const payload = req.body?.data?.payload || req.body?.payload || req.body;
+  const from    = payload?.from?.phone_number || payload?.from || '';
+  const to      = payload?.to?.[0]?.phone_number || payload?.to || '';
+  const text    = payload?.text || payload?.body || '';
+  if (!from || !text) return;
+  const name    = matchName(from);
+  console.log(`📩 Inbound SMS from ${name||from}: "${text.slice(0,80)}"`);
+  DATA.inboundSms.push({
+    id: uid(), from, to, name, text,
+    date: new Date().toISOString(),
+    read: false,
+  });
+  saveData();
+});
+
+// Get inbound SMS
+app.get('/api/sms/inbox', (req,res) => res.json([...DATA.inboundSms].reverse()));
+
+// Mark SMS as read
+app.post('/api/sms/inbox/:id/read', (req,res) => {
+  const m = DATA.inboundSms.find(s=>s.id===req.params.id);
+  if(m) m.read = true;
+  res.json({ok:true});
+});
+
+// Delete SMS
+app.delete('/api/sms/inbox/:id', (req,res) => {
+  DATA.inboundSms = DATA.inboundSms.filter(s=>s.id!==req.params.id);
+  saveData();
+  res.json({ok:true});
+});
 
 // SMS broadcast
 app.post('/api/sms', async (req,res) => {
