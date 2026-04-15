@@ -329,7 +329,11 @@ async function triggerBroadcast(audio, contacts, rsvp=null) {
   for (let i=0;i<contacts.length;i++) {
     const c=contacts[i];
     if (!c.phone) continue;
-    if (i>0) await sleep(5000);
+    if (i>0) {
+      const cpm = DATA.ivrSettings.callsPerMinute || 12;
+      const delayMs = Math.round(60000 / cpm);
+      await sleep(delayMs);
+    }
     const phone=normalizePhone(c.phone);
     try {
       const r=await fetch('https://api.telnyx.com/v2/calls',{
@@ -449,6 +453,7 @@ app.post('/api/sync/ivr',(req,res)=>{
   const{broadcastPin,enabled,greetingId,line2Id}=req.body;
   if(broadcastPin!==undefined)DATA.ivrSettings.broadcastPin=broadcastPin;
   if(enabled!==undefined)DATA.ivrSettings.enabled=enabled;
+  if(req.body.callsPerMinute!==undefined)DATA.ivrSettings.callsPerMinute=parseInt(req.body.callsPerMinute)||12;
   if(greedingId!==undefined)DATA.ivrSettings.greetingId=greetingId;
   if(line2Id!==undefined)DATA.ivrSettings.line2Id=line2Id;
   saveData();res.json({ok:true});});
@@ -475,7 +480,8 @@ app.get('/api/audio/:id',(req,res)=>{
   res.send(Buffer.from(b64,'base64'));});
 
 app.post('/api/broadcast',async(req,res)=>{
-  const{audioId,contactIds,rsvp}=req.body;
+  const{audioId,contactIds,rsvp,callsPerMinute}=req.body;
+  if(callsPerMinute)DATA.ivrSettings.callsPerMinute=parseInt(callsPerMinute)||12;
   const audio=DATA.audioLib.find(a=>a.id===audioId);
   if(!audio)return res.status(404).json({error:'Audio not found'});
   const contacts=contactIds?.length?DATA.contacts.filter(c=>contactIds.includes(c.id)):DATA.contacts;
