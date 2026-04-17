@@ -536,6 +536,26 @@ app.post('/ivr/sms', (req, res) => {
   saveData();
 });
 
+// Proxy voicemail audio (Telnyx URLs require auth)
+app.get('/api/voicemails/:id/audio', async (req,res) => {
+  const vm = DATA.voicemails.find(v=>v.id===req.params.id);
+  if(!vm||!vm.recordingUrl) return res.status(404).send('Not found');
+  try {
+    const r = await fetch(vm.recordingUrl, {
+      headers: vm.recordingUrl.includes('api.telnyx.com')
+        ? {'Authorization': `Bearer ${TELNYX_API_KEY}`}
+        : {}
+    });
+    if(!r.ok) return res.status(404).send('Audio not available');
+    res.setHeader('Content-Type', r.headers.get('content-type')||'audio/mpeg');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    const buf = await r.arrayBuffer();
+    res.send(Buffer.from(buf));
+  } catch(e) {
+    res.status(500).send('Error: '+e.message);
+  }
+});
+
 // Get inbound SMS
 app.get('/api/sms/inbox', (req,res) => res.json([...DATA.inboundSms].reverse()));
 
