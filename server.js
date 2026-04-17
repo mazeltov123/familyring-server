@@ -47,7 +47,7 @@ const _saved = loadData();
 const DATA = {
   contacts:    _saved?.contacts    || [],
   audioLib:    _saved?.audioLib    || [],
-  ivrSettings: _saved?.ivrSettings || { greetingId: null, line2Id: null, broadcastPin: process.env.BROADCAST_PIN || '1234' },
+  ivrSettings: _saved?.ivrSettings || { greetingId: null, line2Id: null, press3Id: null, broadcastPin: process.env.BROADCAST_PIN || '1234' },
   broadcasts:  [],
   callLog:     [],
   voicemails:  [],
@@ -140,8 +140,14 @@ async function handleInbound(type, payload, ccid, state) {
     } else if (state.step === 'pin_entry') {
       const pin = (digits||'').replace('#','');
       if (pin === DATA.ivrSettings.broadcastPin) {
-        await cmd(ccid,'speak',{payload:'PIN accepted. Record your message after the beep. Press pound when finished.',
-          voice:'female',language:'en-US',client_state:enc({mode:'inbound_ivr',step:'record_broadcast_prompt',callerPhone:caller})});
+        const press3Audio = getAudio(DATA.ivrSettings.press3Id);
+        if(press3Audio?.publicUrl){
+          await cmd(ccid,'playback_start',{audio_url:press3Audio.publicUrl,
+            client_state:enc({mode:'inbound_ivr',step:'press3_playing',callerPhone:caller})});
+        } else {
+          await cmd(ccid,'speak',{payload:'PIN accepted. Record your message after the beep. Press pound when finished.',
+            voice:'female',language:'en-US',client_state:enc({mode:'inbound_ivr',step:'record_broadcast_prompt',callerPhone:caller})});
+        }
       } else {
         await cmd(ccid,'gather_using_speak',{payload:'Incorrect PIN. Try again.',voice:'female',language:'en-US',
           minimum_digits:4,maximum_digits:8,inter_digit_timeout_secs:15,
@@ -192,6 +198,9 @@ async function handleInbound(type, payload, ccid, state) {
     if (step === 'line2_playing') {
       await cmd(ccid,'speak',{payload:'Please record your message after the beep. Hang up when done.',voice:'female',language:'en-US',
         client_state:enc({mode:'inbound_ivr',step:'record_prompt',callerPhone:caller})});
+    } else if (step === 'press3_playing') {
+      await cmd(ccid,'record_start',{format:'mp3',channels:'single',play_beep:true,max_length:180,timeout_secs:5,
+        client_state:enc({mode:'inbound_ivr',step:'recording_broadcast',callerPhone:caller})});
     } else if (step === 'playing_broadcast') {
       const usedAudioIds3=new Set(DATA.broadcasts.map(b=>b.audioId).filter(Boolean));
       const list = DATA.audioLib.filter(a=>a.publicUrl&&(a.isBroadcast||usedAudioIds3.has(a.id))).reverse();
@@ -466,6 +475,7 @@ app.post('/api/sync/ivr',(req,res)=>{
   if(broadcastPin!==undefined)DATA.ivrSettings.broadcastPin=broadcastPin;
   if(enabled!==undefined)DATA.ivrSettings.enabled=enabled;
   if(req.body.callsPerMinute!==undefined)DATA.ivrSettings.callsPerMinute=parseInt(req.body.callsPerMinute)||12;
+  if(req.body.press3Id!==undefined)DATA.ivrSettings.press3Id=req.body.press3Id;
   if(greedingId!==undefined)DATA.ivrSettings.greetingId=greetingId;
   if(line2Id!==undefined)DATA.ivrSettings.line2Id=line2Id;
   saveData();res.json({ok:true});});
@@ -479,6 +489,7 @@ app.post('/api/audio/upload',(req,res)=>{
   DATA.audioLib.push(entry);
   if(isGreeting){DATA.ivrSettings.greetingId=id;console.log(`✅ Greeting: "${name}"`);}
   if(isLine2){DATA.ivrSettings.line2Id=id;console.log(`✅ Line2: "${name}"`);}
+  if(req.body.isPress3){DATA.ivrSettings.press3Id=id;console.log(`✅ Press3: "${name}"`);}
   saveData();
   console.log(`✅ Audio: "${name}" (${Math.round(data.length/1024)}KB)`);
   res.json({ok:true,id,publicUrl:entry.publicUrl});});
