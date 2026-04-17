@@ -90,7 +90,7 @@ async function handleInbound(type, payload, ccid, state) {
 
   if (type === 'call.initiated') {
     console.log(`[IVR] Incoming from ${caller}`);
-    await cmd(ccid, 'answer', { client_state: enc({ mode:'inbound_ivr', step:'answering', callerPhone:caller }) });
+    await cmd(ccid, 'answer', { client_state: enc({ mode:'inbound_ivr', step:'answering', callerPhone:caller, callStart:Date.now() }) });
 
   } else if (type === 'call.answered') {
     if (greeting?.publicUrl) {
@@ -226,7 +226,10 @@ async function handleInbound(type, payload, ccid, state) {
 
   } else if (type === 'call.hangup') {
     console.log(`[IVR] Call ended from ${caller}`);
-    DATA.callLog.push({id:uid(),direction:'inbound',number:caller,name:matchName(caller),startTime:Date.now(),status:'completed'});
+    const s = payload?.start_time ? new Date(payload.start_time) : null;
+    const e = payload?.end_time   ? new Date(payload.end_time)   : null;
+    const dur = (s&&e) ? Math.round((e-s)/1000) : (state.callStart ? Math.round((Date.now()-state.callStart)/1000) : 0);
+    DATA.callLog.push({id:uid(),direction:'inbound',number:caller,name:matchName(caller),startTime:s?s.getTime():Date.now(),duration:dur,status:'completed'});
   }
 }
 
@@ -329,6 +332,11 @@ async function triggerBroadcast(audio, contacts, rsvp=null) {
     rsvpOptions:rsvp?.options||null, rsvpResponses:[]};
   DATA.broadcasts.push(rec);
   for (let i=0;i<contacts.length;i++) {
+    // Check if cancelled
+    if (rec.status === 'cancelled') {
+      console.log(`📢 Broadcast ${rec.id} cancelled at contact ${i+1}/${contacts.length}`);
+      break;
+    }
     const c=contacts[i];
     if (!c.phone) continue;
     if (i>0) {
@@ -593,6 +601,18 @@ app.get('/api/voicemails',(req,res)=>res.json(DATA.voicemails));
 app.delete('/api/voicemails/:id',(req,res)=>{DATA.voicemails=DATA.voicemails.filter(v=>v.id!==req.params.id);res.json({ok:true});});
 app.get('/api/calllog',(req,res)=>res.json(DATA.callLog.slice(-200).reverse()));
 app.get('/api/broadcasts',(req,res)=>res.json([...DATA.broadcasts].reverse()));
+// Cancel a running broadcast
+app.post('/api/broadcasts/:id/cancel',(req,res)=>{
+  const br=DATA.broadcasts.find(b=>b.id===req.params.id);
+  if(!br)return res.status(404).json({error:'Not found'});
+  if(br.status!=='running')return res.status(400).json({error:'Broadcast is not running'});
+  br.status='cancelled';
+  br.cancelledAt=new Date().toISOString();
+  saveData();
+  console.log(`🛑 Broadcast ${br.id} cancelled (${br.answered} answered, ${br.missed} missed so far)`);
+  res.json({ok:true,answered:br.answered,missed:br.missed});
+});
+
 app.get('/api/broadcasts/:id/rsvp',(req,res)=>{
   const br=DATA.broadcasts.find(b=>b.id===req.params.id);
   if(!br)return res.status(404).json({error:'Not found'});
