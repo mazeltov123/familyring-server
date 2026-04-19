@@ -114,12 +114,25 @@ async function handleInbound(type, payload, ccid, state) {
 
     if (state.step === 'menu') {
       if (digits === '1') {
-        // Include audio used in any past broadcast OR flagged as broadcast
-        const usedAudioIds=new Set(DATA.broadcasts.map(b=>b.audioId).filter(Boolean));
-        const list=DATA.audioLib.filter(a=>a.publicUrl&&(a.isBroadcast||usedAudioIds.has(a.id))).reverse();
-        console.log(`[IVR] Broadcast list: ${list.length} items, audioLib: ${DATA.audioLib.length}, broadcasts: ${DATA.broadcasts.length}`);
+        // Only include broadcasts where the caller was a recipient
+        const callerNorm = normalizePhone(caller);
+        const callerContact = DATA.contacts.find(ct => normalizePhone(ct.phone) === callerNorm);
+
+        // STRICT: Only play broadcasts where this caller was actually called
+        const callerBroadcastIds = new Set(
+          DATA.callLog
+            .filter(cl => cl.direction==='outbound' && normalizePhone(cl.number)===callerNorm)
+            .map(cl => cl.broadcastId)
+            .filter(Boolean)
+        );
+
+        // Build list: ONLY broadcasts this caller was a direct recipient of
+        const eligibleBroadcasts = DATA.broadcasts.filter(b => callerBroadcastIds.has(b.id));
+        const usedAudioIds = new Set(eligibleBroadcasts.map(b=>b.audioId).filter(Boolean));
+        const list = DATA.audioLib.filter(a=>a.publicUrl && usedAudioIds.has(a.id)).reverse();
+        console.log(`[IVR] Caller ${caller} (${callerContact?.name||'unknown'}): ${callerBroadcastIds.size} broadcasts received, ${list.length} audio files eligible`);
         if (!list.length) {
-          await cmd(ccid,'speak',{payload:'No broadcasts available. Goodbye.',voice:'female',language:'en-US',client_state:enc({mode:'inbound_ivr',step:'goodbye',callerPhone:caller})});
+          await cmd(ccid,'speak',{payload:'No broadcasts available for your number. Goodbye.',voice:'female',language:'en-US',client_state:enc({mode:'inbound_ivr',step:'goodbye',callerPhone:caller})});
         } else {
           await cmd(ccid,'speak',{payload:`Playing broadcast: ${list[0].name}.`,voice:'female',language:'en-US',
             client_state:enc({mode:'inbound_ivr',step:'announce_broadcast',callerPhone:caller,broadcastIndex:0,totalBroadcasts:list.length})});
@@ -171,8 +184,10 @@ async function handleInbound(type, payload, ccid, state) {
   } else if (type === 'call.speak.ended') {
     const step = state.step;
     if (step === 'announce_broadcast') {
-      const usedAudioIds2=new Set(DATA.broadcasts.map(b=>b.audioId).filter(Boolean));
-      const list = DATA.audioLib.filter(a=>a.publicUrl&&(a.isBroadcast||usedAudioIds2.has(a.id))).reverse();
+      const callerNorm2=normalizePhone(caller);
+      const callerBcastIds2=new Set(DATA.callLog.filter(cl=>cl.direction==='outbound'&&normalizePhone(cl.number)===callerNorm2).map(cl=>cl.broadcastId).filter(Boolean));
+      const usedAudioIds2=new Set(DATA.broadcasts.filter(b=>callerBcastIds2.has(b.id)).map(b=>b.audioId).filter(Boolean));
+      const list = DATA.audioLib.filter(a=>a.publicUrl&&usedAudioIds2.has(a.id)).reverse();
       const idx  = state.broadcastIndex||0;
       if (list[idx]?.publicUrl) {
         await cmd(ccid,'playback_start',{audio_url:list[idx].publicUrl,
@@ -202,8 +217,10 @@ async function handleInbound(type, payload, ccid, state) {
       await cmd(ccid,'record_start',{format:'mp3',channels:'single',play_beep:true,max_length:180,timeout_secs:5,
         client_state:enc({mode:'inbound_ivr',step:'recording_broadcast',callerPhone:caller})});
     } else if (step === 'playing_broadcast') {
-      const usedAudioIds3=new Set(DATA.broadcasts.map(b=>b.audioId).filter(Boolean));
-      const list = DATA.audioLib.filter(a=>a.publicUrl&&(a.isBroadcast||usedAudioIds3.has(a.id))).reverse();
+      const callerNorm3=normalizePhone(caller);
+      const callerBcastIds3=new Set(DATA.callLog.filter(cl=>cl.direction==='outbound'&&normalizePhone(cl.number)===callerNorm3).map(cl=>cl.broadcastId).filter(Boolean));
+      const usedAudioIds3=new Set(DATA.broadcasts.filter(b=>callerBcastIds3.has(b.id)).map(b=>b.audioId).filter(Boolean));
+      const list = DATA.audioLib.filter(a=>a.publicUrl&&usedAudioIds3.has(a.id)).reverse();
       const next = (state.broadcastIndex||0)+1;
       if (next < list.length && list[next]?.publicUrl) {
         await cmd(ccid,'speak',{payload:`Next: ${list[next].name}.`,voice:'female',language:'en-US',
