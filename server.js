@@ -392,6 +392,7 @@ function startScheduler() {
   // Task reminder checker
   setInterval(async()=>{
     const now=Date.now();
+    if(!DATA.tasks)DATA.tasks=[];
     const pendingTasks=DATA.tasks.filter(t=>t.status==='pending'&&t.nextSendAt&&t.nextSendAt<=now);
     for(const task of pendingTasks){
       console.log(`📋 Sending reminder to ${task.name}: "${task.message.slice(0,50)}"`);
