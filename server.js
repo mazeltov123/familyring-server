@@ -39,6 +39,7 @@ function saveData() {
       ivrSettings: DATA.ivrSettings,
       scheduled: DATA.scheduled.filter(s=>s.status==='pending'),
       inboundSms: DATA.inboundSms.slice(-200),
+      tasks: DATA.tasks,
     }));
   } catch(e) { console.error('Save data error:', e.message); }
 }
@@ -388,6 +389,31 @@ async function triggerBroadcast(audio, contacts, rsvp=null) {
 }
 
 function startScheduler() {
+  // Task reminder checker
+  setInterval(async()=>{
+    const now=Date.now();
+    const pendingTasks=DATA.tasks.filter(t=>t.status==='pending'&&t.nextSendAt&&t.nextSendAt<=now);
+    for(const task of pendingTasks){
+      console.log(`📋 Sending reminder to ${task.name}: "${task.message.slice(0,50)}"`);
+      try{
+        const r=await fetch('https://api.telnyx.com/v2/messages',{
+          method:'POST',
+          headers:{'Authorization':`Bearer ${TELNYX_API_KEY}`,'Content-Type':'application/json'},
+          body:JSON.stringify({from:TELNYX_FROM,to:task.phone,text:task.message}),
+        });
+        if(r.ok){
+          task.sentCount=(task.sentCount||0)+1;
+          task.lastSentAt=now;
+          task.nextSendAt=now+task.intervalMs;
+          saveData();
+          console.log(`  ✅ Reminder sent (${task.sentCount}x) to ${task.name}`);
+        } else {
+          console.error(`  ❌ Reminder failed for ${task.name}:`, (await r.text()).slice(0,100));
+        }
+      }catch(e){ console.error(`  ❌ Task error: ${e.message}`); }
+    }
+  }, 30000); // check every 30 seconds
+
   setInterval(async()=>{
     const now=new Date();
     const due=DATA.scheduled.filter(s=>s.status==='pending'&&new Date(s.scheduledFor)<=now);
@@ -550,6 +576,24 @@ app.post('/ivr/sms', (req, res) => {
     date: new Date().toISOString(),
     read: false,
   });
+  // Check if this reply completes any pending tasks
+  const fromNorm = normalizePhone(from);
+  const pendingTask = DATA.tasks.find(t =>
+    t.status==='pending' && normalizePhone(t.phone)===fromNorm &&
+    text.toLowerCase().trim().includes((t.doneKeyword||'done').toLowerCase())
+  );
+  if(pendingTask){
+    pendingTask.status='completed';
+    pendingTask.completedAt=Date.now();
+    pendingTask.completedReply=text;
+    console.log(`✅ Task completed by ${name}: "${pendingTask.message.slice(0,40)}"`);
+    // Send confirmation
+    fetch('https://api.telnyx.com/v2/messages',{
+      method:'POST',
+      headers:{'Authorization':`Bearer ${TELNYX_API_KEY}`,'Content-Type':'application/json'},
+      body:JSON.stringify({from:TELNYX_FROM,to:from,text:'✅ Got it! Task marked as done. Thank you.'}),
+    }).catch(()=>{});
+  }
   saveData();
 });
 
@@ -626,6 +670,34 @@ app.post('/api/sms', async (req,res) => {
     }
     console.log(`💬 SMS done — sent: ${sent}, failed: ${failed}`);
   })().catch(console.error);
+});
+
+// Task Reminders
+app.get('/api/tasks',(req,res)=>res.json([...DATA.tasks].reverse()));
+
+app.post('/api/tasks',(req,res)=>{
+  const{contactId,phone,name,message,doneKeyword,intervalMs,firstSendAt}=req.body;
+  if(!phone||!message||!intervalMs)return res.status(400).json({error:'phone, message, intervalMs required'});
+  const task={
+    id:uid(), contactId:contactId||null, phone:normalizePhone(phone), name:name||phone,
+    message, doneKeyword:doneKeyword||'done',
+    intervalMs:parseInt(intervalMs), sentCount:0,
+    nextSendAt: firstSendAt ? new Date(firstSendAt).getTime() : Date.now(),
+    status:'pending', createdAt:new Date().toISOString(),
+    completedAt:null, completedReply:null, lastSentAt:null,
+  };
+  DATA.tasks.push(task);
+  saveData();
+  console.log(`📋 Task created for ${name}: "${message.slice(0,50)}" every ${intervalMs/60000}min`);
+  res.json({ok:true,id:task.id});
+});
+
+app.delete('/api/tasks/:id',(req,res)=>{
+  const t=DATA.tasks.find(x=>x.id===req.params.id);
+  if(!t)return res.status(404).json({error:'Not found'});
+  t.status='cancelled';
+  saveData();
+  res.json({ok:true});
 });
 
 app.post('/api/schedule',(req,res)=>{
