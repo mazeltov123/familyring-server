@@ -393,8 +393,35 @@ function startScheduler() {
   setInterval(async()=>{
     const now=Date.now();
     if(!DATA.tasks)DATA.tasks=[];
+    if(!DATA.tasks)DATA.tasks=[];
     const pendingTasks=DATA.tasks.filter(t=>t.status==='pending'&&t.nextSendAt&&t.nextSendAt<=now);
     for(const task of pendingTasks){
+      // Check weekday restriction
+      if(task.weekDays && task.weekDays.length){
+        const dayNow=new Date().getDay();
+        if(!task.weekDays.includes(dayNow)){
+          // Not today — schedule for next valid day
+          const [h,m]=(task.sendTime||'09:00').split(':').map(Number);
+          for(let d=1;d<=7;d++){
+            const candidate=new Date();
+            candidate.setDate(candidate.getDate()+d);
+            candidate.setHours(h,m,0,0);
+            if(task.weekDays.includes(candidate.getDay())){
+              task.nextSendAt=candidate.getTime();
+              saveData();
+              break;
+            }
+          }
+          continue;
+        }
+      }
+      // Check max repeats
+      if(task.maxRepeats && (task.sentCount||0)>=task.maxRepeats){
+        task.status='expired';
+        saveData();
+        console.log(`📋 Task expired (max ${task.maxRepeats} repeats) for ${task.name}`);
+        continue;
+      }
       console.log(`📋 Sending reminder to ${task.name}: "${task.message.slice(0,50)}"`);
       try{
         const r=await fetch('https://api.telnyx.com/v2/messages',{
@@ -405,7 +432,21 @@ function startScheduler() {
         if(r.ok){
           task.sentCount=(task.sentCount||0)+1;
           task.lastSentAt=now;
-          task.nextSendAt=now+task.intervalMs;
+          // Calculate next send time
+          if(task.weekDays && task.weekDays.length && task.sendTime){
+            const [h,m]=task.sendTime.split(':').map(Number);
+            for(let d=1;d<=7;d++){
+              const candidate=new Date();
+              candidate.setDate(candidate.getDate()+d);
+              candidate.setHours(h,m,0,0);
+              if(task.weekDays.includes(candidate.getDay())){
+                task.nextSendAt=candidate.getTime();
+                break;
+              }
+            }
+          } else {
+            task.nextSendAt=now+task.intervalMs;
+          }
           saveData();
           console.log(`  ✅ Reminder sent (${task.sentCount}x) to ${task.name}`);
         } else {
@@ -677,13 +718,31 @@ app.post('/api/sms', async (req,res) => {
 app.get('/api/tasks',(req,res)=>res.json([...DATA.tasks].reverse()));
 
 app.post('/api/tasks',(req,res)=>{
-  const{contactId,phone,name,message,doneKeyword,intervalMs,firstSendAt}=req.body;
+  const{contactId,phone,name,message,doneKeyword,intervalMs,firstSendAt,weekDays,sendTime,maxRepeats}=req.body;
   if(!phone||!message||!intervalMs)return res.status(400).json({error:'phone, message, intervalMs required'});
+  // Calculate first nextSendAt for weekly tasks
+  let firstNext = firstSendAt ? new Date(firstSendAt).getTime() : Date.now();
+  if(weekDays && weekDays.length && sendTime) {
+    const [h,m] = (sendTime||'09:00').split(':').map(Number);
+    const now = new Date();
+    // Find next occurrence of one of the weekDays
+    for(let d=0; d<=7; d++){
+      const candidate = new Date(now);
+      candidate.setDate(candidate.getDate()+d);
+      candidate.setHours(h,m,0,0);
+      if(weekDays.includes(candidate.getDay()) && candidate.getTime()>Date.now()){
+        firstNext = candidate.getTime();
+        break;
+      }
+    }
+  }
   const task={
     id:uid(), contactId:contactId||null, phone:normalizePhone(phone), name:name||phone,
     message, doneKeyword:doneKeyword||'done',
-    intervalMs:parseInt(intervalMs), sentCount:0,
-    nextSendAt: firstSendAt ? new Date(firstSendAt).getTime() : Date.now(),
+    intervalMs:parseInt(intervalMs)||86400000, sentCount:0,
+    nextSendAt: firstNext,
+    weekDays: weekDays||null, sendTime: sendTime||null,
+    maxRepeats: maxRepeats||null,
     status:'pending', createdAt:new Date().toISOString(),
     completedAt:null, completedReply:null, lastSentAt:null,
   };
