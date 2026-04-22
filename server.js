@@ -40,7 +40,6 @@ function saveData() {
       scheduled: DATA.scheduled.filter(s=>s.status==='pending'),
       inboundSms: DATA.inboundSms.slice(-200),
       tasks: DATA.tasks,
-      tasks: DATA.tasks,
     }));
   } catch(e) { console.error('Save data error:', e.message); }
 }
@@ -53,9 +52,9 @@ const DATA = {
   broadcasts:  [],
   callLog:     [],
   voicemails:  [],
+  inboundSms:  [],
   scheduled:   _saved?.scheduled   || [],
-  inboundSms:  _saved?.inboundSms  || [],
-  tasks:       (_saved?.tasks      || []),
+  tasks:       _saved?.tasks       || [],
 };
 // Ensure PIN from env takes precedence if set
 if (process.env.BROADCAST_PIN) DATA.ivrSettings.broadcastPin = process.env.BROADCAST_PIN;
@@ -395,7 +394,6 @@ function startScheduler() {
   setInterval(async()=>{
     const now=Date.now();
     if(!DATA.tasks)DATA.tasks=[];
-    if(!DATA.tasks)DATA.tasks=[];
     const pendingTasks=DATA.tasks.filter(t=>t.status==='pending'&&t.nextSendAt&&t.nextSendAt<=now);
     for(const task of pendingTasks){
       // Check weekday restriction
@@ -452,7 +450,7 @@ function startScheduler() {
           saveData();
           console.log(`  ✅ Reminder sent (${task.sentCount}x) to ${task.name}`);
         } else {
-          console.error(`  ❌ Reminder failed for ${task.name}:`, (await r.text()).slice(0,100));
+          console.error(`  ❌ Reminder failed for ${task.name}:`, (await r.text()));
         }
       }catch(e){ console.error(`  ❌ Task error: ${e.message}`); }
     }
@@ -563,7 +561,7 @@ app.post('/api/sync/ivr',(req,res)=>{
   if(enabled!==undefined)DATA.ivrSettings.enabled=enabled;
   if(req.body.callsPerMinute!==undefined)DATA.ivrSettings.callsPerMinute=parseInt(req.body.callsPerMinute)||12;
   if(req.body.press3Id!==undefined)DATA.ivrSettings.press3Id=req.body.press3Id;
-  if(greedingId!==undefined)DATA.ivrSettings.greetingId=greetingId;
+  if(greetingId!==undefined)DATA.ivrSettings.greetingId=greetingId;
   if(line2Id!==undefined)DATA.ivrSettings.line2Id=line2Id;
   saveData();res.json({ok:true});});
 
@@ -717,7 +715,7 @@ app.post('/api/sms', async (req,res) => {
 });
 
 // Task Reminders
-app.get('/api/tasks',(req,res)=>res.json([...DATA.tasks].reverse()));
+app.get('/api/tasks',(req,res)=>res.json([...(DATA.tasks||[])].reverse()));
 
 app.post('/api/tasks',(req,res)=>{
   const{contactId,phone,name,message,doneKeyword,intervalMs,firstSendAt,weekDays,sendTime,maxRepeats}=req.body;
