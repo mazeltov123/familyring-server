@@ -40,7 +40,6 @@ function saveData() {
       scheduled: DATA.scheduled.filter(s=>s.status==='pending'),
       inboundSms: DATA.inboundSms.slice(-200),
       tasks: DATA.tasks,
-      tasks: DATA.tasks,
     }));
   } catch(e) { console.error('Save data error:', e.message); }
 }
@@ -53,9 +52,8 @@ const DATA = {
   broadcasts:  [],
   callLog:     [],
   voicemails:  [],
+  inboundSms:  [],
   scheduled:   _saved?.scheduled   || [],
-  inboundSms:  _saved?.inboundSms  || [],
-  tasks:       (_saved?.tasks      || []),
 };
 // Ensure PIN from env takes precedence if set
 if (process.env.BROADCAST_PIN) DATA.ivrSettings.broadcastPin = process.env.BROADCAST_PIN;
