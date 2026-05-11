@@ -562,7 +562,7 @@ app.post('/api/sync/ivr',(req,res)=>{
   if(enabled!==undefined)DATA.ivrSettings.enabled=enabled;
   if(req.body.callsPerMinute!==undefined)DATA.ivrSettings.callsPerMinute=parseInt(req.body.callsPerMinute)||12;
   if(req.body.press3Id!==undefined)DATA.ivrSettings.press3Id=req.body.press3Id;
-  if(greedingId!==undefined)DATA.ivrSettings.greetingId=greetingId;
+  if(greetingId!==undefined)DATA.ivrSettings.greetingId=greetingId;
   if(line2Id!==undefined)DATA.ivrSettings.line2Id=line2Id;
   saveData();res.json({ok:true});});
 
