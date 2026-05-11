@@ -331,6 +331,7 @@ async function handleOutbound(type, payload, ccid, state) {
 }
 
 app.post('/ivr/incoming', async (req,res) => {
+  process.stdout.write(`\n>>>>> WEBHOOK HIT AT ${new Date().toISOString()} <<<<<\n`);
   res.sendStatus(200);
   const event   = req.body?.data || req.body;
   if (!event) return;
