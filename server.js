@@ -17,8 +17,11 @@ const TELNYX_FROM    = normalizePhone(process.env.TELNYX_FROM_NUMBER || '');
 const TELNYX_CONN_ID = process.env.TELNYX_CONNECTION_ID || '';
 const SERVER_URL     = (process.env.SERVER_URL || '').replace(/\/$/, '');
 
-// Persist data to file so it survives server restarts within a session
-const DATA_FILE = '/tmp/familyring_data.json';
+// Persist data to file so it survives server restarts.
+// Prefer a Railway Volume mounted at /data (survives redeploys);
+// fall back to /tmp (ephemeral) if no volume is mounted.
+const DATA_FILE = process.env.DATA_FILE
+  || (require('fs').existsSync('/data') ? '/data/familyring_data.json' : '/tmp/familyring_data.json');
 
 function loadData() {
   try {
@@ -39,7 +42,10 @@ function saveData() {
       ivrSettings: DATA.ivrSettings,
       scheduled: DATA.scheduled.filter(s=>s.status==='pending'),
       inboundSms: DATA.inboundSms.slice(-200),
-      tasks: DATA.tasks,
+      tasks: DATA.tasks || [],
+      voicemails: (DATA.voicemails || []).slice(-500),
+      callLog: (DATA.callLog || []).slice(-500),
+      broadcasts: (DATA.broadcasts || []).slice(-200),
     }));
   } catch(e) { console.error('Save data error:', e.message); }
 }
@@ -49,11 +55,12 @@ const DATA = {
   contacts:    _saved?.contacts    || [],
   audioLib:    _saved?.audioLib    || [],
   ivrSettings: _saved?.ivrSettings || { greetingId: null, line2Id: null, press3Id: null, broadcastPin: process.env.BROADCAST_PIN || '1234' },
-  broadcasts:  [],
-  callLog:     [],
-  voicemails:  [],
-  inboundSms:  [],
+  broadcasts:  _saved?.broadcasts  || [],
+  callLog:     _saved?.callLog     || [],
+  voicemails:  _saved?.voicemails  || [],
+  inboundSms:  _saved?.inboundSms  || [],
   scheduled:   _saved?.scheduled   || [],
+  tasks:       _saved?.tasks       || [],
 };
 // Ensure PIN from env takes precedence if set
 if (process.env.BROADCAST_PIN) DATA.ivrSettings.broadcastPin = process.env.BROADCAST_PIN;
@@ -85,7 +92,9 @@ async function cmd(ccid, action, body={}) {
 }
 
 async function handleInbound(type, payload, ccid, state) {
-  const caller  = state.callerPhone || payload?.from || 'Unknown';
+  const fromStr = (typeof payload?.from === 'string') ? payload.from
+                : (payload?.from?.phone_number || (Array.isArray(payload?.from) ? payload.from[0]?.phone_number : '') || '');
+  const caller  = state.callerPhone || fromStr || 'Unknown';
   const greeting = getAudio(DATA.ivrSettings.greetingId);
   const line2    = getAudio(DATA.ivrSettings.line2Id);
 
@@ -244,6 +253,8 @@ async function handleInbound(type, payload, ccid, state) {
     console.log(`[IVR] Recording saved: ${url} step: ${state.step}`);
     if (state.step === 'recording_voicemail') {
       DATA.voicemails.push({id:uid(),from:caller,name:matchName(caller),recordingUrl:url,date:new Date().toISOString()});
+      saveData();
+      console.log(`📬 Voicemail saved from ${caller} (total: ${DATA.voicemails.length})`);
       await cmd(ccid,'speak',{payload:'Thank you. Message saved. Goodbye.',voice:'female',language:'en-US',
         client_state:enc({mode:'inbound_ivr',step:'record_saved',callerPhone:caller})});
     } else if (state.step === 'recording_broadcast') {
@@ -256,7 +267,9 @@ async function handleInbound(type, payload, ccid, state) {
     const s = payload?.start_time ? new Date(payload.start_time) : null;
     const e = payload?.end_time   ? new Date(payload.end_time)   : null;
     const dur = (s&&e) ? Math.round((e-s)/1000) : (state.callStart ? Math.round((Date.now()-state.callStart)/1000) : 0);
-    DATA.callLog.push({id:uid(),direction:'inbound',number:caller,name:matchName(caller),startTime:s?s.getTime():Date.now(),duration:dur,status:'completed'});
+    const status = dur > 0 ? 'completed' : (payload?.hangup_cause === 'originator_cancel' ? 'caller_hung_up_before_answer' : 'no_answer');
+    DATA.callLog.push({id:uid(),direction:'inbound',number:caller,name:matchName(caller),startTime:s?s.getTime():Date.now(),duration:dur,status,hangupCause:payload?.hangup_cause});
+    saveData();
   }
 }
 
@@ -327,7 +340,16 @@ async function handleOutbound(type, payload, ccid, state) {
       const br=DATA.broadcasts.find(b=>b.id===broadcastId);
       if (br) { if(status==='answered')br.answered++;else br.missed++; if(br.answered+br.missed>=br.totalContacts){br.status='completed';br.endTime=new Date().toISOString();} }
     }
+    saveData();
   }
+}
+
+// Pull a phone number out of payload fields that may be string | object | array
+function extractPhone(v) {
+  if (!v) return '';
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v)) return v[0]?.phone_number || v[0] || '';
+  return v.phone_number || '';
 }
 
 app.post('/ivr/incoming', async (req,res) => {
@@ -340,10 +362,15 @@ app.post('/ivr/incoming', async (req,res) => {
   const ccid    = payload?.call_control_id;
   const state   = dec(payload?.client_state);
   const dir     = payload?.direction;
-  console.log(`[EVT] ${type} | dir=${dir||'?'} | mode=${state.mode||'out'} | step=${state.step||'-'}`);
+  const toNum   = extractPhone(payload?.to);
+  const fromNum = extractPhone(payload?.from);
+  const isInbound = dir==='incoming'
+                 || state.mode==='inbound_ivr'
+                 || (toNum && TELNYX_FROM && normalizePhone(toNum) === TELNYX_FROM);
+  console.log(`[EVT] ${type} | dir=${dir||'?'} | mode=${state.mode||'-'} | step=${state.step||'-'} | from=${fromNum||'?'} | to=${toNum||'?'} | inbound=${isInbound}`);
   if (!ccid) { console.log('Missing ccid, body:', JSON.stringify(req.body).slice(0,200)); return; }
   try {
-    if (dir==='incoming'||state.mode==='inbound_ivr') await handleInbound(type,payload,ccid,state);
+    if (isInbound) await handleInbound(type,payload,ccid,state);
     else await handleOutbound(type,payload,ccid,state);
   } catch(e) { console.error('Handler error:',e.message,e.stack?.slice(0,300)); }
 });
@@ -819,5 +846,6 @@ app.listen(PORT,()=>{
   console.log(`📱 From: ${TELNYX_FROM||'❌ MISSING'}`);
   console.log(`🔗 Conn ID: ${TELNYX_CONN_ID?'✅':'❌ MISSING'}`);
   console.log(`🔐 PIN: ${DATA.ivrSettings.broadcastPin?'****':'NOT SET'}`);
+  console.log(`💾 Data file: ${DATA_FILE} ${DATA_FILE.startsWith('/data')?'(persistent volume)':'(⚠️ EPHEMERAL — mount a Railway volume at /data)'}`);
   startScheduler();
 });
