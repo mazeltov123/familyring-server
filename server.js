@@ -837,7 +837,46 @@ app.post('/api/audio/:id/mark-broadcast',(req,res)=>{
 app.get('/api/data',(req,res)=>res.json({contacts:DATA.contacts.length,
   audioLib:DATA.audioLib.map(a=>({id:a.id,name:a.name,publicUrl:a.publicUrl,isBroadcast:a.isBroadcast,isGreeting:a.isGreeting,isLine2:a.isLine2})),
   ivrSettings:{...DATA.ivrSettings,broadcastPin:'****'},broadcasts:DATA.broadcasts,voicemails:DATA.voicemails,scheduled:DATA.scheduled}));
+// =============== DIAGNOSTIC ENDPOINTS ===============
+const recentEvents = [];
+const recentCmdResults = [];
 
+// Wrap cmd() to record the last 30 Telnyx API calls
+const _origCmd = cmd;
+cmd = async function(ccid, action, body={}) {
+  const entry = { time: new Date().toISOString(), action, ccid: ccid?.slice(0,30), ok: null, status: null, error: null, response: null };
+  try {
+    const r = await fetch(`https://api.telnyx.com/v2/calls/${ccid}/actions/${action}`, {
+      method:'POST',
+      headers:{'Authorization':`Bearer ${TELNYX_API_KEY}`,'Content-Type':'application/json'},
+      body:JSON.stringify(body),
+    });
+    entry.ok = r.ok;
+    entry.status = r.status;
+    if (!r.ok) entry.response = (await r.text()).slice(0, 300);
+    recentCmdResults.unshift(entry);
+    if (recentCmdResults.length > 30) recentCmdResults.pop();
+    return r.ok;
+  } catch(e) {
+    entry.error = e.message;
+    recentCmdResults.unshift(entry);
+    if (recentCmdResults.length > 30) recentCmdResults.pop();
+    return false;
+  }
+};
+
+app.get('/api/debug/cmds', (req,res) => res.json(recentCmdResults));
+app.get('/api/debug/test-telnyx', async (req,res) => {
+  const out = { node: process.version, telnyxFrom: TELNYX_FROM, connId: TELNYX_CONN_ID, hasKey: !!TELNYX_API_KEY, keyLen: TELNYX_API_KEY?.length };
+  try {
+    const r = await fetch('https://api.telnyx.com/v2/balance', { headers: { 'Authorization': `Bearer ${TELNYX_API_KEY}` } });
+    out.balanceStatus = r.status;
+    out.balanceBody = (await r.text()).slice(0,200);
+  } catch(e) {
+    out.fetchError = e.message;
+  }
+  res.json(out);
+});
 const PORT=process.env.PORT||3000;
 app.listen(PORT,()=>{
   console.log(`\n🚀 FamilyRing Server v4 on port ${PORT}`);
