@@ -17,11 +17,8 @@ const TELNYX_FROM    = normalizePhone(process.env.TELNYX_FROM_NUMBER || '');
 const TELNYX_CONN_ID = process.env.TELNYX_CONNECTION_ID || '';
 const SERVER_URL     = (process.env.SERVER_URL || '').replace(/\/$/, '');
 
-// Persist data to file so it survives server restarts.
-// Prefer a Railway Volume mounted at /data (survives redeploys);
-// fall back to /tmp (ephemeral) if no volume is mounted.
-const DATA_FILE = process.env.DATA_FILE
-  || (require('fs').existsSync('/data') ? '/data/familyring_data.json' : '/tmp/familyring_data.json');
+// Persist data to file so it survives server restarts within a session
+const DATA_FILE = '/tmp/familyring_data.json';
 
 function loadData() {
   try {
@@ -42,10 +39,7 @@ function saveData() {
       ivrSettings: DATA.ivrSettings,
       scheduled: DATA.scheduled.filter(s=>s.status==='pending'),
       inboundSms: DATA.inboundSms.slice(-200),
-      tasks: DATA.tasks || [],
-      voicemails: (DATA.voicemails || []).slice(-500),
-      callLog: (DATA.callLog || []).slice(-500),
-      broadcasts: (DATA.broadcasts || []).slice(-200),
+      tasks: DATA.tasks,
     }));
   } catch(e) { console.error('Save data error:', e.message); }
 }
@@ -55,12 +49,11 @@ const DATA = {
   contacts:    _saved?.contacts    || [],
   audioLib:    _saved?.audioLib    || [],
   ivrSettings: _saved?.ivrSettings || { greetingId: null, line2Id: null, press3Id: null, broadcastPin: process.env.BROADCAST_PIN || '1234' },
-  broadcasts:  _saved?.broadcasts  || [],
-  callLog:     _saved?.callLog     || [],
-  voicemails:  _saved?.voicemails  || [],
-  inboundSms:  _saved?.inboundSms  || [],
+  broadcasts:  [],
+  callLog:     [],
+  voicemails:  [],
+  inboundSms:  [],
   scheduled:   _saved?.scheduled   || [],
-  tasks:       _saved?.tasks       || [],
 };
 // Ensure PIN from env takes precedence if set
 if (process.env.BROADCAST_PIN) DATA.ivrSettings.broadcastPin = process.env.BROADCAST_PIN;
@@ -92,9 +85,7 @@ async function cmd(ccid, action, body={}) {
 }
 
 async function handleInbound(type, payload, ccid, state) {
-  const fromStr = (typeof payload?.from === 'string') ? payload.from
-                : (payload?.from?.phone_number || (Array.isArray(payload?.from) ? payload.from[0]?.phone_number : '') || '');
-  const caller  = state.callerPhone || fromStr || 'Unknown';
+  const caller  = state.callerPhone || payload?.from || 'Unknown';
   const greeting = getAudio(DATA.ivrSettings.greetingId);
   const line2    = getAudio(DATA.ivrSettings.line2Id);
 
@@ -253,8 +244,6 @@ async function handleInbound(type, payload, ccid, state) {
     console.log(`[IVR] Recording saved: ${url} step: ${state.step}`);
     if (state.step === 'recording_voicemail') {
       DATA.voicemails.push({id:uid(),from:caller,name:matchName(caller),recordingUrl:url,date:new Date().toISOString()});
-      saveData();
-      console.log(`📬 Voicemail saved from ${caller} (total: ${DATA.voicemails.length})`);
       await cmd(ccid,'speak',{payload:'Thank you. Message saved. Goodbye.',voice:'female',language:'en-US',
         client_state:enc({mode:'inbound_ivr',step:'record_saved',callerPhone:caller})});
     } else if (state.step === 'recording_broadcast') {
@@ -267,9 +256,7 @@ async function handleInbound(type, payload, ccid, state) {
     const s = payload?.start_time ? new Date(payload.start_time) : null;
     const e = payload?.end_time   ? new Date(payload.end_time)   : null;
     const dur = (s&&e) ? Math.round((e-s)/1000) : (state.callStart ? Math.round((Date.now()-state.callStart)/1000) : 0);
-    const status = dur > 0 ? 'completed' : (payload?.hangup_cause === 'originator_cancel' ? 'caller_hung_up_before_answer' : 'no_answer');
-    DATA.callLog.push({id:uid(),direction:'inbound',number:caller,name:matchName(caller),startTime:s?s.getTime():Date.now(),duration:dur,status,hangupCause:payload?.hangup_cause});
-    saveData();
+    DATA.callLog.push({id:uid(),direction:'inbound',number:caller,name:matchName(caller),startTime:s?s.getTime():Date.now(),duration:dur,status:'completed'});
   }
 }
 
@@ -340,16 +327,7 @@ async function handleOutbound(type, payload, ccid, state) {
       const br=DATA.broadcasts.find(b=>b.id===broadcastId);
       if (br) { if(status==='answered')br.answered++;else br.missed++; if(br.answered+br.missed>=br.totalContacts){br.status='completed';br.endTime=new Date().toISOString();} }
     }
-    saveData();
   }
-}
-
-// Pull a phone number out of payload fields that may be string | object | array
-function extractPhone(v) {
-  if (!v) return '';
-  if (typeof v === 'string') return v;
-  if (Array.isArray(v)) return v[0]?.phone_number || v[0] || '';
-  return v.phone_number || '';
 }
 
 app.post('/ivr/incoming', async (req,res) => {
@@ -362,30 +340,29 @@ app.post('/ivr/incoming', async (req,res) => {
   const ccid    = payload?.call_control_id;
   const state   = dec(payload?.client_state);
   const dir     = payload?.direction;
-  const toNum   = extractPhone(payload?.to);
-  const fromNum = extractPhone(payload?.from);
-  const isInbound = dir==='incoming'
-                 || state.mode==='inbound_ivr'
-                 || (toNum && TELNYX_FROM && normalizePhone(toNum) === TELNYX_FROM);
-  console.log(`[EVT] ${type} | dir=${dir||'?'} | mode=${state.mode||'-'} | step=${state.step||'-'} | from=${fromNum||'?'} | to=${toNum||'?'} | inbound=${isInbound}`);
+  console.log(`[EVT] ${type} | dir=${dir||'?'} | mode=${state.mode||'out'} | step=${state.step||'-'}`);
   if (!ccid) { console.log('Missing ccid, body:', JSON.stringify(req.body).slice(0,200)); return; }
   try {
-    if (isInbound) await handleInbound(type,payload,ccid,state);
+    if (dir==='incoming'||state.mode==='inbound_ivr') await handleInbound(type,payload,ccid,state);
     else await handleOutbound(type,payload,ccid,state);
   } catch(e) { console.error('Handler error:',e.message,e.stack?.slice(0,300)); }
 });
 
-async function triggerBroadcast(audio, contacts, rsvp=null) {
+async function triggerBroadcast(audio, contacts, rsvp=null, existingId=null) {
   if (!contacts.length) return;
   console.log(`\n📢 BROADCAST "${audio.name}" → ${contacts.length} contacts`);
   // Mark audio as broadcast so IVR can play it back
   const audioEntry = DATA.audioLib.find(a=>a.id===audio.id);
   if(audioEntry && !audioEntry.isBroadcast){ audioEntry.isBroadcast=true; saveData(); }
 
-  const rec={id:uid(),audioName:audio.name,audioId:audio.id,startTime:new Date().toISOString(),
-    totalContacts:contacts.length,answered:0,missed:0,status:'running',
-    rsvpOptions:rsvp?.options||null, rsvpResponses:[]};
-  DATA.broadcasts.push(rec);
+  // Reuse existing record if API handler already created one, otherwise create new
+  let rec = existingId ? DATA.broadcasts.find(b=>b.id===existingId) : null;
+  if (!rec) {
+    rec={id:uid(),audioName:audio.name,audioId:audio.id,startTime:new Date().toISOString(),
+      totalContacts:contacts.length,answered:0,missed:0,status:'running',
+      rsvpOptions:rsvp?.options||null, rsvpResponses:[]};
+    DATA.broadcasts.push(rec);
+  }
   for (let i=0;i<contacts.length;i++) {
     // Check if cancelled
     if (rec.status === 'cancelled') {
@@ -589,7 +566,7 @@ app.post('/api/sync/ivr',(req,res)=>{
   if(enabled!==undefined)DATA.ivrSettings.enabled=enabled;
   if(req.body.callsPerMinute!==undefined)DATA.ivrSettings.callsPerMinute=parseInt(req.body.callsPerMinute)||12;
   if(req.body.press3Id!==undefined)DATA.ivrSettings.press3Id=req.body.press3Id;
-  if(greetingId!==undefined)DATA.ivrSettings.greetingId=greetingId;
+  if(greedingId!==undefined)DATA.ivrSettings.greetingId=greetingId;
   if(line2Id!==undefined)DATA.ivrSettings.line2Id=line2Id;
   saveData();res.json({ok:true});});
 
@@ -837,46 +814,7 @@ app.post('/api/audio/:id/mark-broadcast',(req,res)=>{
 app.get('/api/data',(req,res)=>res.json({contacts:DATA.contacts.length,
   audioLib:DATA.audioLib.map(a=>({id:a.id,name:a.name,publicUrl:a.publicUrl,isBroadcast:a.isBroadcast,isGreeting:a.isGreeting,isLine2:a.isLine2})),
   ivrSettings:{...DATA.ivrSettings,broadcastPin:'****'},broadcasts:DATA.broadcasts,voicemails:DATA.voicemails,scheduled:DATA.scheduled}));
-// =============== DIAGNOSTIC ENDPOINTS ===============
-const recentEvents = [];
-const recentCmdResults = [];
 
-// Wrap cmd() to record the last 30 Telnyx API calls
-const _origCmd = cmd;
-cmd = async function(ccid, action, body={}) {
-  const entry = { time: new Date().toISOString(), action, ccid: ccid?.slice(0,30), ok: null, status: null, error: null, response: null };
-  try {
-    const r = await fetch(`https://api.telnyx.com/v2/calls/${ccid}/actions/${action}`, {
-      method:'POST',
-      headers:{'Authorization':`Bearer ${TELNYX_API_KEY}`,'Content-Type':'application/json'},
-      body:JSON.stringify(body),
-    });
-    entry.ok = r.ok;
-    entry.status = r.status;
-    if (!r.ok) entry.response = (await r.text()).slice(0, 300);
-    recentCmdResults.unshift(entry);
-    if (recentCmdResults.length > 30) recentCmdResults.pop();
-    return r.ok;
-  } catch(e) {
-    entry.error = e.message;
-    recentCmdResults.unshift(entry);
-    if (recentCmdResults.length > 30) recentCmdResults.pop();
-    return false;
-  }
-};
-
-app.get('/api/debug/cmds', (req,res) => res.json(recentCmdResults));
-app.get('/api/debug/test-telnyx', async (req,res) => {
-  const out = { node: process.version, telnyxFrom: TELNYX_FROM, connId: TELNYX_CONN_ID, hasKey: !!TELNYX_API_KEY, keyLen: TELNYX_API_KEY?.length };
-  try {
-    const r = await fetch('https://api.telnyx.com/v2/balance', { headers: { 'Authorization': `Bearer ${TELNYX_API_KEY}` } });
-    out.balanceStatus = r.status;
-    out.balanceBody = (await r.text()).slice(0,200);
-  } catch(e) {
-    out.fetchError = e.message;
-  }
-  res.json(out);
-});
 const PORT=process.env.PORT||3000;
 app.listen(PORT,()=>{
   console.log(`\n🚀 FamilyRing Server v4 on port ${PORT}`);
@@ -885,6 +823,5 @@ app.listen(PORT,()=>{
   console.log(`📱 From: ${TELNYX_FROM||'❌ MISSING'}`);
   console.log(`🔗 Conn ID: ${TELNYX_CONN_ID?'✅':'❌ MISSING'}`);
   console.log(`🔐 PIN: ${DATA.ivrSettings.broadcastPin?'****':'NOT SET'}`);
-  console.log(`💾 Data file: ${DATA_FILE} ${DATA_FILE.startsWith('/data')?'(persistent volume)':'(⚠️ EPHEMERAL — mount a Railway volume at /data)'}`);
   startScheduler();
 });
