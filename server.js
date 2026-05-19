@@ -785,6 +785,10 @@ app.get('/api/scheduled',(req,res)=>res.json(DATA.scheduled));
 app.get('/api/voicemails',(req,res)=>res.json(DATA.voicemails));
 app.delete('/api/voicemails/:id',(req,res)=>{DATA.voicemails=DATA.voicemails.filter(v=>v.id!==req.params.id);res.json({ok:true});});
 app.get('/api/calllog',(req,res)=>res.json(DATA.callLog.slice(-200).reverse()));
+app.get('/api/broadcasts/:id/calllog',(req,res)=>{
+  const calls=DATA.callLog.filter(c=>c.broadcastId===req.params.id).reverse();
+  res.json(calls);
+});
 app.get('/api/broadcasts',(req,res)=>res.json([...DATA.broadcasts].reverse()));
 // Cancel a running broadcast
 app.post('/api/broadcasts/:id/cancel',(req,res)=>{
