@@ -73,6 +73,15 @@ function dec(s) { try { return JSON.parse(Buffer.from(s||'','base64').toString()
 function getAudio(id) { return id ? DATA.audioLib.find(a => a.id === id) : null; }
 function matchName(num) { const d=(num||'').replace(/\D/g,''); return DATA.contacts.find(c=>(c.phone||'').replace(/\D/g,'')===d)?.name||''; }
 
+// Return the list of recipients for a task. New countdown tasks store a
+// `recipients` array; legacy tasks (single-recipient) only have phone/name.
+// This helper unifies them so the scheduler can loop the same way for both.
+function taskRecipients(task) {
+  if (Array.isArray(task.recipients) && task.recipients.length) return task.recipients;
+  if (task.phone) return [{ phone: task.phone, name: task.name||task.phone, contactId: task.contactId||null }];
+  return [];
+}
+
 // Compute Unix-ms timestamp for "tomorrow at HH:MM in America/New_York".
 // Used by countdown task scheduler so reminders go out at the chosen ET time daily.
 function nextSendAtEastern(hour, minute) {
@@ -436,10 +445,8 @@ function startScheduler() {
       // ── COUNTDOWN MODE ────────────────────────────────────────────────
       if(task.mode==='countdown'){
         // Calculate days remaining in Eastern Time
-        // Get "today" in ET as YYYY-MM-DD
         const etNow = new Date(new Date().toLocaleString('en-US',{timeZone:'America/New_York'}));
         const etTodayStr = etNow.getFullYear()+'-'+String(etNow.getMonth()+1).padStart(2,'0')+'-'+String(etNow.getDate()).padStart(2,'0');
-        // Parse dates as UTC midnight to compare day diff cleanly
         const todayMid = new Date(etTodayStr+'T00:00:00Z').getTime();
         const targetMid = new Date(task.targetDate+'T00:00:00Z').getTime();
         const daysLeft = Math.round((targetMid - todayMid)/86400000);
@@ -447,50 +454,56 @@ function startScheduler() {
         let textToSend;
         let isFinalSend = false;
         if(daysLeft < 0){
-          // Past target — mark complete and skip
           task.status='completed';
           task.completedAt=new Date().toISOString();
           saveData();
-          console.log(`📋 Countdown task completed (past target) for ${task.name}: ${task.eventLabel}`);
+          console.log(`📋 Countdown task completed (past target): ${task.eventLabel}`);
           continue;
         } else if(daysLeft === 0){
-          // Final day
           textToSend = (task.finalMessage||'Today is {label}!').replace(/\{label\}/g, task.eventLabel);
           isFinalSend = true;
         } else {
-          // Days remaining
           textToSend = (task.messageTemplate||'{n} days left to {label}')
             .replace(/\{n\}/g, daysLeft)
             .replace(/\{label\}/g, task.eventLabel);
         }
 
-        console.log(`📋 Sending countdown to ${task.name}: "${textToSend}"`);
-        try{
-          const r=await fetch('https://api.telnyx.com/v2/messages',{
-            method:'POST',
-            headers:{'Authorization':`Bearer ${TELNYX_API_KEY}`,'Content-Type':'application/json'},
-            body:JSON.stringify({from:TELNYX_FROM,to:task.phone,text:textToSend}),
-          });
-          if(r.ok){
-            task.sentCount=(task.sentCount||0)+1;
-            task.lastSentAt=now;
-            if(isFinalSend){
-              task.status='completed';
-              task.completedAt=new Date().toISOString();
-              console.log(`  ✅ Final countdown sent to ${task.name} (${task.sentCount}x total)`);
-            } else {
-              // Schedule for tomorrow at sendTime ET
-              const [sh,sm] = (task.sendTime||'09:00').split(':').map(Number);
-              // Compute tomorrow at sh:sm in America/New_York
-              task.nextSendAt = nextSendAtEastern(sh, sm);
-              console.log(`  ✅ Countdown sent (${task.sentCount}x), next at ${new Date(task.nextSendAt).toISOString()}`);
-            }
-            saveData();
+        const recipients = taskRecipients(task);
+        console.log(`📋 Sending countdown "${task.eventLabel}" to ${recipients.length} recipient(s): "${textToSend}"`);
+        let sent = 0, failed = 0;
+        for(let i=0; i<recipients.length; i++){
+          const rcp = recipients[i];
+          if(i>0) await sleep(400); // throttle
+          try{
+            const r=await fetch('https://api.telnyx.com/v2/messages',{
+              method:'POST',
+              headers:{'Authorization':`Bearer ${TELNYX_API_KEY}`,'Content-Type':'application/json'},
+              body:JSON.stringify({from:TELNYX_FROM,to:rcp.phone,text:textToSend}),
+            });
+            if(r.ok){ sent++; console.log(`  ✅ ${i+1}/${recipients.length} → ${rcp.name} (${rcp.phone})`); }
+            else { const t=await r.text(); failed++; console.error(`  ❌ ${rcp.name}: ${t.slice(0,200)}`); }
+          }catch(e){ failed++; console.error(`  ❌ ${rcp.name}: ${e.message}`); }
+        }
+
+        if(sent > 0){
+          task.sentCount=(task.sentCount||0)+1;
+          task.lastSentAt=now;
+          if(isFinalSend){
+            task.status='completed';
+            task.completedAt=new Date().toISOString();
+            console.log(`📋 Final countdown sent for "${task.eventLabel}" (cycle ${task.sentCount}, ${sent} sent, ${failed} failed)`);
           } else {
-            const errText = await r.text();
-            console.error(`  ❌ Countdown failed for ${task.name}:`, errText);
+            const [sh,sm] = (task.sendTime||'09:00').split(':').map(Number);
+            task.nextSendAt = nextSendAtEastern(sh, sm);
+            console.log(`📋 Countdown cycle ${task.sentCount} done (${sent} sent, ${failed} failed). Next: ${new Date(task.nextSendAt).toISOString()}`);
           }
-        }catch(e){ console.error(`  ❌ Countdown error: ${e.message}`); }
+          saveData();
+        } else {
+          // All sends failed — retry in 10 minutes instead of waiting until tomorrow
+          task.nextSendAt = now + 10*60*1000;
+          saveData();
+          console.error(`📋 All ${recipients.length} sends failed; retrying in 10 minutes`);
+        }
         continue;
       }
 
@@ -816,8 +829,7 @@ app.get('/api/tasks',(req,res)=>res.json([...DATA.tasks].reverse()));
 
 app.post('/api/tasks',(req,res)=>{
   const{contactId,phone,name,message,doneKeyword,intervalMs,firstSendAt,weekDays,sendTime,maxRepeats,
-        mode,targetDate,eventLabel,messageTemplate,finalMessage}=req.body;
-  if(!phone)return res.status(400).json({error:'phone required'});
+        mode,targetDate,eventLabel,messageTemplate,finalMessage,recipients}=req.body;
 
   const isCountdown = mode==='countdown';
 
@@ -825,7 +837,18 @@ app.post('/api/tasks',(req,res)=>{
   if(isCountdown){
     if(!targetDate)return res.status(400).json({error:'targetDate required for countdown'});
     if(!eventLabel)return res.status(400).json({error:'eventLabel required for countdown'});
+    // For countdown, accept either a recipients array OR legacy single phone field
+    const recList = Array.isArray(recipients) && recipients.length
+      ? recipients
+      : (phone ? [{phone, name: name||phone, contactId: contactId||null}] : []);
+    if(!recList.length) return res.status(400).json({error:'At least one recipient required'});
+    // Normalize phones
+    var normalizedRecipients = recList
+      .filter(r => r && r.phone)
+      .map(r => ({phone: normalizePhone(r.phone), name: r.name||r.phone, contactId: r.contactId||null}));
+    if(!normalizedRecipients.length) return res.status(400).json({error:'At least one valid phone required'});
   } else {
+    if(!phone)return res.status(400).json({error:'phone required'});
     if(!message||!intervalMs)return res.status(400).json({error:'message and intervalMs required'});
   }
 
@@ -850,7 +873,13 @@ app.post('/api/tasks',(req,res)=>{
   }
 
   const task={
-    id:uid(), contactId:contactId||null, phone:normalizePhone(phone), name:name||phone,
+    id:uid(),
+    // Legacy single-recipient fields (kept populated to first recipient for backward compat in UI lists)
+    contactId: isCountdown ? (normalizedRecipients[0].contactId||null) : (contactId||null),
+    phone:     isCountdown ? normalizedRecipients[0].phone           : normalizePhone(phone),
+    name:      isCountdown ? (normalizedRecipients[0].name||phone)   : (name||phone),
+    // Recipients list (countdown only — null for legacy recurring tasks)
+    recipients: isCountdown ? normalizedRecipients : null,
     message: message||'', doneKeyword:doneKeyword||'done',
     intervalMs: isCountdown ? 86400000 : (parseInt(intervalMs)||86400000),
     sentCount:0, nextSendAt: firstNext,
@@ -867,11 +896,59 @@ app.post('/api/tasks',(req,res)=>{
   DATA.tasks.push(task);
   saveData();
   if(isCountdown){
-    console.log(`📋 Countdown task created for ${name}: "${eventLabel}" on ${targetDate}, sends at ${task.sendTime} ET`);
+    console.log(`📋 Countdown task created: "${eventLabel}" on ${targetDate}, ${normalizedRecipients.length} recipients, sends at ${task.sendTime} ET`);
   } else {
     console.log(`📋 Task created for ${name}: "${message.slice(0,50)}" every ${intervalMs/60000}min`);
   }
-  res.json({ok:true,id:task.id});
+  res.json({ok:true,id:task.id,recipientCount: isCountdown ? normalizedRecipients.length : 1});
+});
+
+// Edit an existing task (currently supports countdown tasks).
+// All fields are optional in the body; only those provided are updated.
+app.put('/api/tasks/:id',(req,res)=>{
+  const task = DATA.tasks.find(t => t.id === req.params.id);
+  if(!task) return res.status(404).json({error:'Task not found'});
+  if(task.status !== 'pending') return res.status(400).json({error:'Only pending tasks can be edited'});
+
+  const {targetDate, eventLabel, messageTemplate, finalMessage, sendTime, recipients,
+         message, doneKeyword, intervalMs, maxRepeats} = req.body;
+
+  if(task.mode === 'countdown'){
+    if(targetDate!==undefined){
+      if(!targetDate) return res.status(400).json({error:'targetDate cannot be empty'});
+      task.targetDate = targetDate;
+    }
+    if(eventLabel!==undefined){
+      if(!eventLabel.trim()) return res.status(400).json({error:'eventLabel cannot be empty'});
+      task.eventLabel = eventLabel.trim();
+    }
+    if(messageTemplate!==undefined) task.messageTemplate = messageTemplate || '{n} days left to {label}';
+    if(finalMessage!==undefined)    task.finalMessage    = finalMessage    || 'Today is {label}!';
+    if(sendTime!==undefined)        task.sendTime        = sendTime        || '09:00';
+    if(Array.isArray(recipients)){
+      const norm = recipients
+        .filter(r => r && r.phone)
+        .map(r => ({phone: normalizePhone(r.phone), name: r.name||r.phone, contactId: r.contactId||null}));
+      if(!norm.length) return res.status(400).json({error:'At least one valid recipient required'});
+      task.recipients = norm;
+      // Keep legacy single-recipient fields pointing at first for UI display
+      task.phone = norm[0].phone;
+      task.name = norm[0].name;
+      task.contactId = norm[0].contactId;
+    }
+  } else {
+    // Recurring task edits
+    if(message!==undefined && message.trim()) task.message = message;
+    if(doneKeyword!==undefined && doneKeyword.trim()) task.doneKeyword = doneKeyword.trim();
+    if(intervalMs!==undefined) task.intervalMs = parseInt(intervalMs) || task.intervalMs;
+    if(maxRepeats!==undefined) task.maxRepeats = maxRepeats;
+    if(sendTime!==undefined)   task.sendTime   = sendTime || task.sendTime;
+  }
+
+  task.updatedAt = new Date().toISOString();
+  saveData();
+  console.log(`📋 Task ${task.id} updated (${task.mode})`);
+  res.json({ok:true, task});
 });
 
 app.delete('/api/tasks/:id',(req,res)=>{
