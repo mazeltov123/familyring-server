@@ -1,3 +1,4 @@
+ · JS
 // ============================================================
 // FamilyRing Cloud Server v4
 // Based on proven Base44/Telnyx Call Control API v2 approach
@@ -7,19 +8,19 @@ require('dotenv').config();
 const express = require('express');
 const cors    = require('cors');
 const app     = express();
-
+ 
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(cors());
-
+ 
 const TELNYX_API_KEY = process.env.TELNYX_API_KEY || '';
 const TELNYX_FROM    = normalizePhone(process.env.TELNYX_FROM_NUMBER || '');
 const TELNYX_CONN_ID = process.env.TELNYX_CONNECTION_ID || '';
 const SERVER_URL     = (process.env.SERVER_URL || '').replace(/\/$/, '');
-
+ 
 // Persist data to file so it survives server restarts within a session
 const DATA_FILE = '/tmp/familyring_data.json';
-
+ 
 function loadData() {
   try {
     if (require('fs').existsSync(DATA_FILE)) {
@@ -30,7 +31,7 @@ function loadData() {
   } catch(e) { console.log('No persisted data found, starting fresh'); }
   return null;
 }
-
+ 
 function saveData() {
   try {
     require('fs').writeFileSync(DATA_FILE, JSON.stringify({
@@ -43,7 +44,7 @@ function saveData() {
     }));
   } catch(e) { console.error('Save data error:', e.message); }
 }
-
+ 
 const _saved = loadData();
 const DATA = {
   contacts:    _saved?.contacts    || [],
@@ -57,7 +58,7 @@ const DATA = {
 };
 // Ensure PIN from env takes precedence if set
 if (process.env.BROADCAST_PIN) DATA.ivrSettings.broadcastPin = process.env.BROADCAST_PIN;
-
+ 
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,7);
 function normalizePhone(p) {
   if (!p) return '';
@@ -72,7 +73,40 @@ function enc(o) { return Buffer.from(JSON.stringify(o)).toString('base64'); }
 function dec(s) { try { return JSON.parse(Buffer.from(s||'','base64').toString()); } catch { return {}; } }
 function getAudio(id) { return id ? DATA.audioLib.find(a => a.id === id) : null; }
 function matchName(num) { const d=(num||'').replace(/\D/g,''); return DATA.contacts.find(c=>(c.phone||'').replace(/\D/g,'')===d)?.name||''; }
-
+ 
+// Compute Unix-ms timestamp for "tomorrow at HH:MM in America/New_York".
+// Used by countdown task scheduler so reminders go out at the chosen ET time daily.
+function nextSendAtEastern(hour, minute) {
+  // Get current ET date components
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year:'numeric', month:'2-digit', day:'2-digit',
+    hour:'2-digit', minute:'2-digit', hour12:false
+  });
+  const parts = fmt.formatToParts(new Date()).reduce((a,p)=>{a[p.type]=p.value;return a;}, {});
+  const etYear = parseInt(parts.year);
+  const etMonth = parseInt(parts.month);
+  const etDay = parseInt(parts.day);
+  // Build a date for tomorrow at hour:minute ET. We construct using UTC offset of -5 (EST) or -4 (EDT).
+  // Easier approach: use toLocaleString trick to find what UTC instant corresponds to ET hour:minute tomorrow.
+  // Start with tomorrow's date in ET
+  const tomorrow = new Date(Date.UTC(etYear, etMonth-1, etDay)+86400000);
+  const ty = tomorrow.getUTCFullYear();
+  const tm = tomorrow.getUTCMonth();
+  const td = tomorrow.getUTCDate();
+  // Iterate hours of UTC to find the one that maps to hour:minute ET on that date
+  for(let utcH=0; utcH<48; utcH++){
+    const candidate = new Date(Date.UTC(ty, tm, td, utcH, minute, 0));
+    const cf = fmt.formatToParts(candidate).reduce((a,p)=>{a[p.type]=p.value;return a;}, {});
+    if(parseInt(cf.year)===ty && parseInt(cf.month)===tm+1 && parseInt(cf.day)===td
+       && parseInt(cf.hour)===hour && parseInt(cf.minute)===minute){
+      return candidate.getTime();
+    }
+  }
+  // Fallback: 24h from now
+  return Date.now() + 86400000;
+}
+ 
 async function cmd(ccid, action, body={}) {
   console.log(`[CMD] ${action} ${ccid?.slice(0,18)}`);
   const r = await fetch(`https://api.telnyx.com/v2/calls/${ccid}/actions/${action}`, {
@@ -83,16 +117,16 @@ async function cmd(ccid, action, body={}) {
   if (!r.ok) console.error(`[CMD] ${action} FAILED:`, (await r.text()).slice(0,200));
   return r.ok;
 }
-
+ 
 async function handleInbound(type, payload, ccid, state) {
   const caller  = state.callerPhone || payload?.from || 'Unknown';
   const greeting = getAudio(DATA.ivrSettings.greetingId);
   const line2    = getAudio(DATA.ivrSettings.line2Id);
-
+ 
   if (type === 'call.initiated') {
     console.log(`[IVR] Incoming from ${caller}`);
     await cmd(ccid, 'answer', { client_state: enc({ mode:'inbound_ivr', step:'answering', callerPhone:caller, callStart:Date.now() }) });
-
+ 
   } else if (type === 'call.answered') {
     if (greeting?.publicUrl) {
       await cmd(ccid, 'gather_using_audio', {
@@ -108,17 +142,17 @@ async function handleInbound(type, payload, ccid, state) {
         client_state: enc({ mode:'inbound_ivr', step:'menu', callerPhone:caller }),
       });
     }
-
+ 
   } else if (type === 'call.gather.ended') {
     const digits = payload?.digits || '';
     console.log(`[IVR] digits="${digits}" step="${state.step}"`);
-
+ 
     if (state.step === 'menu') {
       if (digits === '1') {
         // Only include broadcasts where the caller was a recipient
         const callerNorm = normalizePhone(caller);
         const callerContact = DATA.contacts.find(ct => normalizePhone(ct.phone) === callerNorm);
-
+ 
         // STRICT: Only play broadcasts where this caller was actually called
         const callerBroadcastIds = new Set(
           DATA.callLog
@@ -126,7 +160,7 @@ async function handleInbound(type, payload, ccid, state) {
             .map(cl => cl.broadcastId)
             .filter(Boolean)
         );
-
+ 
         // Build list: ONLY broadcasts this caller was a direct recipient of
         const eligibleBroadcasts = DATA.broadcasts.filter(b => callerBroadcastIds.has(b.id));
         const usedAudioIds = new Set(eligibleBroadcasts.map(b=>b.audioId).filter(Boolean));
@@ -150,7 +184,7 @@ async function handleInbound(type, payload, ccid, state) {
           minimum_digits:4,maximum_digits:8,inter_digit_timeout_secs:15,
           client_state:enc({mode:'inbound_ivr',step:'pin_entry',callerPhone:caller})});
       } else { await cmd(ccid,'hangup',{}); }
-
+ 
     } else if (state.step === 'pin_entry') {
       const pin = (digits||'').replace('#','');
       if (pin === DATA.ivrSettings.broadcastPin) {
@@ -167,7 +201,7 @@ async function handleInbound(type, payload, ccid, state) {
           minimum_digits:4,maximum_digits:8,inter_digit_timeout_secs:15,
           client_state:enc({mode:'inbound_ivr',step:'pin_entry',callerPhone:caller})});
       }
-
+ 
     } else if (state.step === 'broadcast_review') {
       const d = (digits||'').replace('#','');
       if (d === '1') {
@@ -181,7 +215,7 @@ async function handleInbound(type, payload, ccid, state) {
           client_state:enc({mode:'inbound_ivr',step:'record_broadcast_prompt',callerPhone:caller})});
       } else { await cmd(ccid,'hangup',{}); }
     }
-
+ 
   } else if (type === 'call.speak.ended') {
     const step = state.step;
     if (step === 'announce_broadcast') {
@@ -208,7 +242,7 @@ async function handleInbound(type, payload, ccid, state) {
     } else if (step === 'goodbye' || step === 'record_saved') {
       await cmd(ccid,'hangup',{});
     }
-
+ 
   } else if (type === 'call.playback.ended') {
     const step = state.step;
     if (step === 'line2_playing') {
@@ -238,7 +272,7 @@ async function handleInbound(type, payload, ccid, state) {
         client_state:enc({mode:'inbound_ivr',step:'broadcast_review',callerPhone:caller,recordingUrl:state.recordingUrl}),
       });
     }
-
+ 
   } else if (type === 'call.recording.saved') {
     const url = payload?.recording_urls?.mp3 || payload?.public_recording_urls?.mp3 || '';
     console.log(`[IVR] Recording saved: ${url} step: ${state.step}`);
@@ -250,7 +284,7 @@ async function handleInbound(type, payload, ccid, state) {
       await cmd(ccid,'speak',{payload:'Recording complete. Here is your message.',voice:'female',language:'en-US',
         client_state:enc({mode:'inbound_ivr',step:'playback_before_review',callerPhone:caller,recordingUrl:url})});
     }
-
+ 
   } else if (type === 'call.hangup') {
     console.log(`[IVR] Call ended from ${caller}`);
     const s = payload?.start_time ? new Date(payload.start_time) : null;
@@ -259,10 +293,10 @@ async function handleInbound(type, payload, ccid, state) {
     DATA.callLog.push({id:uid(),direction:'inbound',number:caller,name:matchName(caller),startTime:s?s.getTime():Date.now(),duration:dur,status:'completed'});
   }
 }
-
+ 
 async function handleOutbound(type, payload, ccid, state) {
   const { audioUrl, contactName, phone, broadcastId, rsvp } = state;
-
+ 
   if (type === 'call.answered') {
     console.log(`[OUT] Answered: ${contactName} rsvp=${!!rsvp}`);
     if (audioUrl) {
@@ -270,7 +304,7 @@ async function handleOutbound(type, payload, ccid, state) {
     } else {
       await cmd(ccid,'speak',{payload:'Hello, this is a message from Family Ring.',voice:'female',language:'en-US',client_state:enc(state)});
     }
-
+ 
   } else if (type === 'call.playback.ended' || type === 'call.speak.ended') {
     // If RSVP options exist, gather response after audio plays
     if (rsvp && rsvp.options && rsvp.options.length > 0 && state.step !== 'rsvp_done') {
@@ -287,7 +321,7 @@ async function handleOutbound(type, payload, ccid, state) {
     } else {
       await cmd(ccid,'hangup',{});
     }
-
+ 
   } else if (type === 'call.gather.ended' && state.step === 'rsvp_waiting') {
     const digit = payload?.digits || '';
     const option = rsvp?.options?.find(o => o.key === digit);
@@ -311,7 +345,7 @@ async function handleOutbound(type, payload, ccid, state) {
       payload: thanks, voice:'female', language:'en-US',
       client_state: enc({...state, step:'rsvp_done'}),
     });
-
+ 
   } else if (type === 'call.hangup') {
     const cause = payload?.hangup_cause||'unknown';
     const s = payload?.start_time?new Date(payload.start_time):null;
@@ -329,7 +363,7 @@ async function handleOutbound(type, payload, ccid, state) {
     }
   }
 }
-
+ 
 app.post('/ivr/incoming', async (req,res) => {
   process.stdout.write(`\n>>>>> WEBHOOK HIT AT ${new Date().toISOString()} <<<<<\n`);
   res.sendStatus(200);
@@ -347,14 +381,14 @@ app.post('/ivr/incoming', async (req,res) => {
     else await handleOutbound(type,payload,ccid,state);
   } catch(e) { console.error('Handler error:',e.message,e.stack?.slice(0,300)); }
 });
-
+ 
 async function triggerBroadcast(audio, contacts, rsvp=null, existingId=null) {
   if (!contacts.length) return;
   console.log(`\n📢 BROADCAST "${audio.name}" → ${contacts.length} contacts`);
   // Mark audio as broadcast so IVR can play it back
   const audioEntry = DATA.audioLib.find(a=>a.id===audio.id);
   if(audioEntry && !audioEntry.isBroadcast){ audioEntry.isBroadcast=true; saveData(); }
-
+ 
   // Reuse existing record if API handler already created one, otherwise create new
   let rec = existingId ? DATA.broadcasts.find(b=>b.id===existingId) : null;
   if (!rec) {
@@ -392,20 +426,80 @@ async function triggerBroadcast(audio, contacts, rsvp=null, existingId=null) {
   }
   console.log('📢 All calls initiated');
 }
-
+ 
 function startScheduler() {
   // Task reminder checker
   setInterval(async()=>{
     const now=Date.now();
     if(!DATA.tasks)DATA.tasks=[];
-    if(!DATA.tasks)DATA.tasks=[];
     const pendingTasks=DATA.tasks.filter(t=>t.status==='pending'&&t.nextSendAt&&t.nextSendAt<=now);
     for(const task of pendingTasks){
+      // ── COUNTDOWN MODE ────────────────────────────────────────────────
+      if(task.mode==='countdown'){
+        // Calculate days remaining in Eastern Time
+        // Get "today" in ET as YYYY-MM-DD
+        const etNow = new Date(new Date().toLocaleString('en-US',{timeZone:'America/New_York'}));
+        const etTodayStr = etNow.getFullYear()+'-'+String(etNow.getMonth()+1).padStart(2,'0')+'-'+String(etNow.getDate()).padStart(2,'0');
+        // Parse dates as UTC midnight to compare day diff cleanly
+        const todayMid = new Date(etTodayStr+'T00:00:00Z').getTime();
+        const targetMid = new Date(task.targetDate+'T00:00:00Z').getTime();
+        const daysLeft = Math.round((targetMid - todayMid)/86400000);
+ 
+        let textToSend;
+        let isFinalSend = false;
+        if(daysLeft < 0){
+          // Past target — mark complete and skip
+          task.status='completed';
+          task.completedAt=new Date().toISOString();
+          saveData();
+          console.log(`📋 Countdown task completed (past target) for ${task.name}: ${task.eventLabel}`);
+          continue;
+        } else if(daysLeft === 0){
+          // Final day
+          textToSend = (task.finalMessage||'Today is {label}!').replace(/\{label\}/g, task.eventLabel);
+          isFinalSend = true;
+        } else {
+          // Days remaining
+          textToSend = (task.messageTemplate||'{n} days left to {label}')
+            .replace(/\{n\}/g, daysLeft)
+            .replace(/\{label\}/g, task.eventLabel);
+        }
+ 
+        console.log(`📋 Sending countdown to ${task.name}: "${textToSend}"`);
+        try{
+          const r=await fetch('https://api.telnyx.com/v2/messages',{
+            method:'POST',
+            headers:{'Authorization':`Bearer ${TELNYX_API_KEY}`,'Content-Type':'application/json'},
+            body:JSON.stringify({from:TELNYX_FROM,to:task.phone,text:textToSend}),
+          });
+          if(r.ok){
+            task.sentCount=(task.sentCount||0)+1;
+            task.lastSentAt=now;
+            if(isFinalSend){
+              task.status='completed';
+              task.completedAt=new Date().toISOString();
+              console.log(`  ✅ Final countdown sent to ${task.name} (${task.sentCount}x total)`);
+            } else {
+              // Schedule for tomorrow at sendTime ET
+              const [sh,sm] = (task.sendTime||'09:00').split(':').map(Number);
+              // Compute tomorrow at sh:sm in America/New_York
+              task.nextSendAt = nextSendAtEastern(sh, sm);
+              console.log(`  ✅ Countdown sent (${task.sentCount}x), next at ${new Date(task.nextSendAt).toISOString()}`);
+            }
+            saveData();
+          } else {
+            const errText = await r.text();
+            console.error(`  ❌ Countdown failed for ${task.name}:`, errText);
+          }
+        }catch(e){ console.error(`  ❌ Countdown error: ${e.message}`); }
+        continue;
+      }
+ 
+      // ── REGULAR/RECURRING MODE ────────────────────────────────────────
       // Check weekday restriction
       if(task.weekDays && task.weekDays.length){
         const dayNow=new Date().getDay();
         if(!task.weekDays.includes(dayNow)){
-          // Not today — schedule for next valid day
           const [h,m]=(task.sendTime||'09:00').split(':').map(Number);
           for(let d=1;d<=7;d++){
             const candidate=new Date();
@@ -437,7 +531,6 @@ function startScheduler() {
         if(r.ok){
           task.sentCount=(task.sentCount||0)+1;
           task.lastSentAt=now;
-          // Calculate next send time
           if(task.weekDays && task.weekDays.length && task.sendTime){
             const [h,m]=task.sendTime.split(':').map(Number);
             for(let d=1;d<=7;d++){
@@ -460,7 +553,7 @@ function startScheduler() {
       }catch(e){ console.error(`  ❌ Task error: ${e.message}`); }
     }
   }, 30000); // check every 30 seconds
-
+ 
   setInterval(async()=>{
     const now=new Date();
     const due=DATA.scheduled.filter(s=>s.status==='pending'&&new Date(s.scheduledFor)<=now);
@@ -475,7 +568,7 @@ function startScheduler() {
   },60000);
   console.log('⏰ Scheduler running (every 60s)');
 }
-
+ 
 // PWA Manifest
 app.get('/manifest.json', (req, res) => {
   res.json({
@@ -493,7 +586,7 @@ app.get('/manifest.json', (req, res) => {
     ]
   });
 });
-
+ 
 // Generate a simple PNG icon programmatically
 function generateIconPng(size) {
   // Minimal valid PNG with FamilyRing colors (dark background, phone emoji area)
@@ -501,7 +594,7 @@ function generateIconPng(size) {
   const { createCanvas } = (() => { try { return require('canvas'); } catch(e) { return null; } })() || {};
   return null; // fallback to SVG-based approach below
 }
-
+ 
 app.get('/icon-:size.png', (req, res) => {
   const size = parseInt(req.params.size) || 192;
   // Serve an SVG as PNG fallback (browsers accept this for PWA icons)
@@ -513,7 +606,7 @@ app.get('/icon-:size.png', (req, res) => {
   res.setHeader('Content-Type', 'image/svg+xml');
   res.send(svg);
 });
-
+ 
 // Service worker for offline support
 app.get('/sw.js', (req, res) => {
   res.type('application/javascript');
@@ -525,7 +618,7 @@ self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => clients.claim());
   `);
 });
-
+ 
 // Serve the FamilyRing web app
 let APP_HTML = null;
 app.get('/app', (req, res) => {
@@ -537,7 +630,7 @@ app.get('/app', (req, res) => {
     res.send('<h2>App not uploaded yet. POST the HTML to /api/app/upload</h2><p>Or visit <a href="/">server status</a></p>');
   }
 });
-
+ 
 // Upload the app HTML (call this once after deploying)
 app.post('/api/app/upload', (req, res) => {
   const { html } = req.body;
@@ -546,7 +639,7 @@ app.post('/api/app/upload', (req, res) => {
   console.log(`✅ App HTML uploaded (${Math.round(html.length/1024)}KB)`);
   res.json({ ok: true, url: SERVER_URL + '/app', size: Math.round(html.length/1024) + 'KB' });
 });
-
+ 
 app.get('/',(req,res)=>res.json({status:'✅ FamilyRing Server',contacts:DATA.contacts.length,audio:DATA.audioLib.length,
   broadcasts:DATA.broadcasts.length,voicemails:DATA.voicemails.length,
   scheduled:DATA.scheduled.filter(s=>s.status==='pending').length,
@@ -555,11 +648,11 @@ app.get('/',(req,res)=>res.json({status:'✅ FamilyRing Server',contacts:DATA.co
   smsWebhook:`${SERVER_URL}/ivr/sms`,
   inboundSms:DATA.inboundSms.length,
   app:`${SERVER_URL}/app`}));
-
+ 
 app.post('/api/sync/contacts',(req,res)=>{
   if(!Array.isArray(req.body.contacts))return res.status(400).json({error:'array required'});
   DATA.contacts=req.body.contacts;saveData();console.log(`✅ ${DATA.contacts.length} contacts`);res.json({ok:true,count:DATA.contacts.length});});
-
+ 
 app.post('/api/sync/ivr',(req,res)=>{
   const{broadcastPin,enabled,greetingId,line2Id}=req.body;
   if(broadcastPin!==undefined)DATA.ivrSettings.broadcastPin=broadcastPin;
@@ -569,7 +662,7 @@ app.post('/api/sync/ivr',(req,res)=>{
   if(greedingId!==undefined)DATA.ivrSettings.greetingId=greetingId;
   if(line2Id!==undefined)DATA.ivrSettings.line2Id=line2Id;
   saveData();res.json({ok:true});});
-
+ 
 app.post('/api/audio/upload',(req,res)=>{
   const{name,data,type,isBroadcast,isGreeting,isLine2}=req.body;
   if(!name||!data)return res.status(400).json({error:'name+data required'});
@@ -583,7 +676,7 @@ app.post('/api/audio/upload',(req,res)=>{
   saveData();
   console.log(`✅ Audio: "${name}" (${Math.round(data.length/1024)}KB)`);
   res.json({ok:true,id,publicUrl:entry.publicUrl});});
-
+ 
 app.get('/api/audio/:id',(req,res)=>{
   const a=DATA.audioLib.find(x=>x.id===req.params.id);
   if(!a?.data)return res.status(404).send('Not found');
@@ -591,7 +684,7 @@ app.get('/api/audio/:id',(req,res)=>{
   res.setHeader('Content-Type',a.type||'audio/mpeg');
   res.setHeader('Cache-Control','public,max-age=3600');
   res.send(Buffer.from(b64,'base64'));});
-
+ 
 app.post('/api/broadcast',async(req,res)=>{
   const{audioId,contactIds,rsvp,callsPerMinute}=req.body;
   if(callsPerMinute)DATA.ivrSettings.callsPerMinute=parseInt(callsPerMinute)||12;
@@ -607,7 +700,7 @@ app.post('/api/broadcast',async(req,res)=>{
   DATA.broadcasts.push(rec);
   res.json({ok:true,contacts:contacts.length,audio:audio.name,broadcastId:bcastId});
   triggerBroadcast(audio,contacts,rsvp||null,bcastId).catch(console.error);});
-
+ 
 // Inbound SMS webhook (Telnyx sends here when someone texts your number)
 app.post('/ivr/sms', (req, res) => {
   res.sendStatus(200);
@@ -643,7 +736,7 @@ app.post('/ivr/sms', (req, res) => {
   }
   saveData();
 });
-
+ 
 // Proxy voicemail audio (Telnyx URLs require auth)
 app.get('/api/voicemails/:id/audio', async (req,res) => {
   const vm = DATA.voicemails.find(v=>v.id===req.params.id);
@@ -663,24 +756,24 @@ app.get('/api/voicemails/:id/audio', async (req,res) => {
     res.status(500).send('Error: '+e.message);
   }
 });
-
+ 
 // Get inbound SMS
 app.get('/api/sms/inbox', (req,res) => res.json([...DATA.inboundSms].reverse()));
-
+ 
 // Mark SMS as read
 app.post('/api/sms/inbox/:id/read', (req,res) => {
   const m = DATA.inboundSms.find(s=>s.id===req.params.id);
   if(m) m.read = true;
   res.json({ok:true});
 });
-
+ 
 // Delete SMS
 app.delete('/api/sms/inbox/:id', (req,res) => {
   DATA.inboundSms = DATA.inboundSms.filter(s=>s.id!==req.params.id);
   saveData();
   res.json({ok:true});
 });
-
+ 
 // SMS broadcast
 app.post('/api/sms', async (req,res) => {
   const { message, contactIds } = req.body;
@@ -689,9 +782,9 @@ app.post('/api/sms', async (req,res) => {
     ? DATA.contacts.filter(c => contactIds.includes(c.id))
     : DATA.contacts;
   if (!contacts.length) return res.status(400).json({ error: 'No contacts' });
-
+ 
   res.json({ ok: true, sent: contacts.length, message: message.slice(0,50)+'…' });
-
+ 
   // Fire SMS async
   (async () => {
     console.log(`💬 SMS broadcast to ${contacts.length} contacts`);
@@ -718,19 +811,34 @@ app.post('/api/sms', async (req,res) => {
     console.log(`💬 SMS done — sent: ${sent}, failed: ${failed}`);
   })().catch(console.error);
 });
-
+ 
 // Task Reminders
 app.get('/api/tasks',(req,res)=>res.json([...DATA.tasks].reverse()));
-
+ 
 app.post('/api/tasks',(req,res)=>{
-  const{contactId,phone,name,message,doneKeyword,intervalMs,firstSendAt,weekDays,sendTime,maxRepeats}=req.body;
-  if(!phone||!message||!intervalMs)return res.status(400).json({error:'phone, message, intervalMs required'});
-  // Calculate first nextSendAt for weekly tasks
+  const{contactId,phone,name,message,doneKeyword,intervalMs,firstSendAt,weekDays,sendTime,maxRepeats,
+        mode,targetDate,eventLabel,messageTemplate,finalMessage}=req.body;
+  if(!phone)return res.status(400).json({error:'phone required'});
+ 
+  const isCountdown = mode==='countdown';
+ 
+  // Validate per mode
+  if(isCountdown){
+    if(!targetDate)return res.status(400).json({error:'targetDate required for countdown'});
+    if(!eventLabel)return res.status(400).json({error:'eventLabel required for countdown'});
+  } else {
+    if(!message||!intervalMs)return res.status(400).json({error:'message and intervalMs required'});
+  }
+ 
+  // Calculate first nextSendAt
   let firstNext = firstSendAt ? new Date(firstSendAt).getTime() : Date.now();
-  if(weekDays && weekDays.length && sendTime) {
+ 
+  if(isCountdown){
+    // Countdown: first send right now (within next scheduler tick), then daily at sendTime ET
+    firstNext = Date.now();
+  } else if(weekDays && weekDays.length && sendTime) {
     const [h,m] = (sendTime||'09:00').split(':').map(Number);
     const now = new Date();
-    // Find next occurrence of one of the weekDays
     for(let d=0; d<=7; d++){
       const candidate = new Date(now);
       candidate.setDate(candidate.getDate()+d);
@@ -741,22 +849,32 @@ app.post('/api/tasks',(req,res)=>{
       }
     }
   }
+ 
   const task={
     id:uid(), contactId:contactId||null, phone:normalizePhone(phone), name:name||phone,
-    message, doneKeyword:doneKeyword||'done',
-    intervalMs:parseInt(intervalMs)||86400000, sentCount:0,
-    nextSendAt: firstNext,
-    weekDays: weekDays||null, sendTime: sendTime||null,
-    maxRepeats: maxRepeats||null,
+    message: message||'', doneKeyword:doneKeyword||'done',
+    intervalMs: isCountdown ? 86400000 : (parseInt(intervalMs)||86400000),
+    sentCount:0, nextSendAt: firstNext,
+    weekDays: weekDays||null, sendTime: sendTime||'09:00',
+    maxRepeats: isCountdown ? null : (maxRepeats||null),
+    mode: isCountdown ? 'countdown' : 'recurring',
+    targetDate: isCountdown ? targetDate : null,
+    eventLabel: isCountdown ? eventLabel : null,
+    messageTemplate: isCountdown ? (messageTemplate||'{n} days left to {label}') : null,
+    finalMessage: isCountdown ? (finalMessage||'Today is {label}!') : null,
     status:'pending', createdAt:new Date().toISOString(),
     completedAt:null, completedReply:null, lastSentAt:null,
   };
   DATA.tasks.push(task);
   saveData();
-  console.log(`📋 Task created for ${name}: "${message.slice(0,50)}" every ${intervalMs/60000}min`);
+  if(isCountdown){
+    console.log(`📋 Countdown task created for ${name}: "${eventLabel}" on ${targetDate}, sends at ${task.sendTime} ET`);
+  } else {
+    console.log(`📋 Task created for ${name}: "${message.slice(0,50)}" every ${intervalMs/60000}min`);
+  }
   res.json({ok:true,id:task.id});
 });
-
+ 
 app.delete('/api/tasks/:id',(req,res)=>{
   const t=DATA.tasks.find(x=>x.id===req.params.id);
   if(!t)return res.status(404).json({error:'Not found'});
@@ -764,7 +882,7 @@ app.delete('/api/tasks/:id',(req,res)=>{
   saveData();
   res.json({ok:true});
 });
-
+ 
 app.post('/api/schedule',(req,res)=>{
   const{audioId,recipientIds,scheduledFor,name}=req.body;
   if(!audioId||!scheduledFor)return res.status(400).json({error:'audioId+scheduledFor required'});
@@ -775,12 +893,12 @@ app.post('/api/schedule',(req,res)=>{
   saveData();
   console.log(`⏰ Scheduled: "${entry.name}" for ${scheduledFor}`);
   res.json({ok:true,id:entry.id});});
-
+ 
 app.delete('/api/schedule/:id',(req,res)=>{
   const s=DATA.scheduled.find(x=>x.id===req.params.id);
   if(!s)return res.status(404).json({error:'Not found'});
   s.status='cancelled';res.json({ok:true});});
-
+ 
 app.get('/api/scheduled',(req,res)=>res.json(DATA.scheduled));
 app.get('/api/voicemails',(req,res)=>res.json(DATA.voicemails));
 app.delete('/api/voicemails/:id',(req,res)=>{DATA.voicemails=DATA.voicemails.filter(v=>v.id!==req.params.id);res.json({ok:true});});
@@ -801,7 +919,7 @@ app.post('/api/broadcasts/:id/cancel',(req,res)=>{
   console.log(`🛑 Broadcast ${br.id} cancelled (${br.answered} answered, ${br.missed} missed so far)`);
   res.json({ok:true,answered:br.answered,missed:br.missed});
 });
-
+ 
 app.get('/api/broadcasts/:id/rsvp',(req,res)=>{
   const br=DATA.broadcasts.find(b=>b.id===req.params.id);
   if(!br)return res.status(404).json({error:'Not found'});
@@ -814,11 +932,11 @@ app.post('/api/audio/:id/mark-broadcast',(req,res)=>{
   a.isBroadcast=true;saveData();
   res.json({ok:true,name:a.name});
 });
-
+ 
 app.get('/api/data',(req,res)=>res.json({contacts:DATA.contacts.length,
   audioLib:DATA.audioLib.map(a=>({id:a.id,name:a.name,publicUrl:a.publicUrl,isBroadcast:a.isBroadcast,isGreeting:a.isGreeting,isLine2:a.isLine2})),
   ivrSettings:{...DATA.ivrSettings,broadcastPin:'****'},broadcasts:DATA.broadcasts,voicemails:DATA.voicemails,scheduled:DATA.scheduled}));
-
+ 
 const PORT=process.env.PORT||3000;
 app.listen(PORT,()=>{
   console.log(`\n🚀 FamilyRing Server v4 on port ${PORT}`);
