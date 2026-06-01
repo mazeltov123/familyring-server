@@ -82,6 +82,71 @@ function taskRecipients(task) {
   return [];
 }
 
+// Compute live broadcast stats from the authoritative call log.
+// Single source of truth: the counts you see ALWAYS reflect what the call log
+// actually contains. No drift, no orphans, no incrementer bugs.
+//
+// To handle the orphan-broadcast bug from older data: if no call records match
+// this broadcast's id, check for a sibling broadcast (same audioName, startTime
+// within 60 seconds) and use its calls instead. That recovers the historical
+// "answered" numbers for broadcasts whose calls were tagged with the wrong id.
+function computeBroadcastStats(br) {
+  if (!br) return null;
+  let calls = DATA.callLog.filter(c => c.broadcastId === br.id && c.direction === 'outbound');
+  let usedFallback = false;
+
+  if (!calls.length) {
+    // Orphan recovery: look for a sibling broadcast within ±60s with same audio
+    const myStart = br.startTime ? new Date(br.startTime).getTime() : null;
+    if (myStart) {
+      const sibling = DATA.broadcasts.find(b =>
+        b.id !== br.id &&
+        b.audioName === br.audioName &&
+        b.startTime &&
+        Math.abs(new Date(b.startTime).getTime() - myStart) <= 60000
+      );
+      if (sibling) {
+        const siblingCalls = DATA.callLog.filter(c => c.broadcastId === sibling.id && c.direction === 'outbound');
+        if (siblingCalls.length) { calls = siblingCalls; usedFallback = true; }
+      }
+    }
+  }
+
+  const answered = calls.filter(c => c.status === 'answered').length;
+  const missed = calls.filter(c => c.status !== 'answered').length;
+  const completed = answered + missed;
+  const total = br.totalContacts || 0;
+  // Pending = total - attempted (calls not even started yet by the loop)
+  const attempted = typeof br.attempted === 'number' ? br.attempted : completed;
+  const pending = Math.max(0, total - attempted);
+  // Ringing = attempted but no hangup yet
+  const ringing = Math.max(0, attempted - completed - (br.failedToStart||0));
+
+  return {
+    total, answered, missed, attempted, pending, ringing,
+    failedToStart: br.failedToStart||0,
+    completedRatio: total > 0 ? (completed/total) : 0,
+    usedFallback,
+  };
+}
+
+// Decorate a broadcast record with live stats. Use this in any endpoint that
+// returns broadcasts to the UI.
+function enrichBroadcast(br) {
+  if (!br) return br;
+  const stats = computeBroadcastStats(br);
+  return {
+    ...br,
+    answered: stats.answered,
+    missed: stats.missed,
+    attempted: stats.attempted,
+    pending: stats.pending,
+    ringing: stats.ringing,
+    failedToStart: stats.failedToStart,
+    _statsFromFallback: stats.usedFallback,
+  };
+}
+
 // Compute Unix-ms timestamp for "tomorrow at HH:MM in America/New_York".
 // Used by countdown task scheduler so reminders go out at the chosen ET time daily.
 function nextSendAtEastern(hour, minute) {
@@ -364,11 +429,19 @@ async function handleOutbound(type, payload, ccid, state) {
     else if (cause==='user_busy') status='busy';
     else if (['no_answer','timeout','call_rejected'].includes(cause)) status='no_answer';
     console.log(`[OUT] Hangup ${contactName} — ${status} ${dur}s`);
-    DATA.callLog.push({id:uid(),direction:'outbound',number:phone,name:contactName,broadcastId,duration:dur,status,startTime:Date.now()});
+    DATA.callLog.push({id:uid(),direction:'outbound',number:phone,name:contactName,broadcastId,duration:dur,status,startTime:Date.now(),endTime:Date.now()});
     if (broadcastId) {
       const br=DATA.broadcasts.find(b=>b.id===broadcastId);
-      if (br) { if(status==='answered')br.answered++;else br.missed++; if(br.answered+br.missed>=br.totalContacts){br.status='completed';br.endTime=new Date().toISOString();} }
+      if (br && br.status === 'running') {
+        // Auto-complete when every contact has a hangup recorded
+        const stats = computeBroadcastStats(br);
+        if (stats.answered + stats.missed >= br.totalContacts) {
+          br.status='completed';
+          br.endTime=new Date().toISOString();
+        }
+      }
     }
+    saveData();
   }
 }
 
@@ -401,9 +474,13 @@ async function triggerBroadcast(audio, contacts, rsvp=null, existingId=null) {
   let rec = existingId ? DATA.broadcasts.find(b=>b.id===existingId) : null;
   if (!rec) {
     rec={id:uid(),audioName:audio.name,audioId:audio.id,startTime:new Date().toISOString(),
-      totalContacts:contacts.length,answered:0,missed:0,status:'running',
+      totalContacts:contacts.length,answered:0,missed:0,attempted:0,failedToStart:0,status:'running',
       rsvpOptions:rsvp?.options||null, rsvpResponses:[]};
     DATA.broadcasts.push(rec);
+  } else {
+    // Ensure new fields exist on reused record
+    if(typeof rec.attempted !== 'number') rec.attempted = 0;
+    if(typeof rec.failedToStart !== 'number') rec.failedToStart = 0;
   }
   for (let i=0;i<contacts.length;i++) {
     // Check if cancelled
@@ -428,11 +505,25 @@ async function triggerBroadcast(audio, contacts, rsvp=null, existingId=null) {
           client_state:enc({broadcastId:rec.id,contactName:c.name||'',phone,audioUrl:audio.publicUrl||'',rsvp:rsvp||null}),
           timeout_secs:30}),
       });
-      if (r.ok) console.log(`  ✅ ${i+1}/${contacts.length} ${c.name} (${phone})`);
-      else { const t=await r.text(); console.error(`  ❌ ${c.name}: ${t.slice(0,150)}`); rec.missed++; }
-    } catch(e) { console.error(`  ❌ ${c.name}: ${e.message}`); rec.missed++; }
+      rec.attempted = (rec.attempted||0) + 1;
+      if (r.ok) {
+        console.log(`  ✅ ${i+1}/${contacts.length} ${c.name} (${phone})`);
+      } else {
+        const t=await r.text();
+        console.error(`  ❌ ${c.name}: ${t.slice(0,150)}`);
+        rec.failedToStart = (rec.failedToStart||0) + 1;
+      }
+    } catch(e) {
+      console.error(`  ❌ ${c.name}: ${e.message}`);
+      rec.attempted = (rec.attempted||0) + 1;
+      rec.failedToStart = (rec.failedToStart||0) + 1;
+    }
+    // Save every few calls so progress survives a restart
+    if ((i+1) % 5 === 0) saveData();
   }
-  console.log('📢 All calls initiated');
+  // Final save once loop is done
+  saveData();
+  console.log(`📢 All ${rec.attempted}/${contacts.length} calls initiated for "${rec.audioName||rec.id}"`);
 }
 
 function startScheduler() {
@@ -980,10 +1071,26 @@ app.get('/api/voicemails',(req,res)=>res.json(DATA.voicemails));
 app.delete('/api/voicemails/:id',(req,res)=>{DATA.voicemails=DATA.voicemails.filter(v=>v.id!==req.params.id);res.json({ok:true});});
 app.get('/api/calllog',(req,res)=>res.json(DATA.callLog.slice(-200).reverse()));
 app.get('/api/broadcasts/:id/calllog',(req,res)=>{
-  const calls=DATA.callLog.filter(c=>c.broadcastId===req.params.id).reverse();
-  res.json(calls);
+  const br = DATA.broadcasts.find(b => b.id === req.params.id);
+  let calls = DATA.callLog.filter(c => c.broadcastId === req.params.id && c.direction === 'outbound');
+  // Orphan recovery: if no direct matches, try the sibling broadcast (see computeBroadcastStats)
+  if (!calls.length && br) {
+    const myStart = br.startTime ? new Date(br.startTime).getTime() : null;
+    if (myStart) {
+      const sibling = DATA.broadcasts.find(b =>
+        b.id !== br.id &&
+        b.audioName === br.audioName &&
+        b.startTime &&
+        Math.abs(new Date(b.startTime).getTime() - myStart) <= 60000
+      );
+      if (sibling) {
+        calls = DATA.callLog.filter(c => c.broadcastId === sibling.id && c.direction === 'outbound');
+      }
+    }
+  }
+  res.json(calls.reverse());
 });
-app.get('/api/broadcasts',(req,res)=>res.json([...DATA.broadcasts].reverse()));
+app.get('/api/broadcasts',(req,res)=>res.json([...DATA.broadcasts].reverse().map(enrichBroadcast)));
 // Cancel a running broadcast
 app.post('/api/broadcasts/:id/cancel',(req,res)=>{
   const br=DATA.broadcasts.find(b=>b.id===req.params.id);
@@ -994,6 +1101,24 @@ app.post('/api/broadcasts/:id/cancel',(req,res)=>{
   saveData();
   console.log(`🛑 Broadcast ${br.id} cancelled (${br.answered} answered, ${br.missed} missed so far)`);
   res.json({ok:true,answered:br.answered,missed:br.missed});
+});
+
+// Delete a broadcast record (and optionally its associated call log entries).
+// Use ?withCalls=1 to also delete the call records tied to this broadcast.
+app.delete('/api/broadcasts/:id',(req,res)=>{
+  const id = req.params.id;
+  const before = DATA.broadcasts.length;
+  DATA.broadcasts = DATA.broadcasts.filter(b => b.id !== id);
+  const removed = before - DATA.broadcasts.length;
+  let callsRemoved = 0;
+  if(req.query.withCalls === '1'){
+    const beforeC = DATA.callLog.length;
+    DATA.callLog = DATA.callLog.filter(c => c.broadcastId !== id);
+    callsRemoved = beforeC - DATA.callLog.length;
+  }
+  saveData();
+  console.log(`🗑 Broadcast ${id} deleted (${removed} record, ${callsRemoved} call log entries)`);
+  res.json({ok:true, removed, callsRemoved});
 });
 
 app.get('/api/broadcasts/:id/rsvp',(req,res)=>{
